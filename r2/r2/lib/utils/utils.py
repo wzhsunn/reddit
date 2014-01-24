@@ -25,6 +25,7 @@ import base64
 import traceback
 import ConfigParser
 import codecs
+import itertools
 
 from babel.dates import TIMEDELTA_UNITS
 from urllib import unquote_plus
@@ -53,16 +54,10 @@ from r2.lib.utils._utils import *
 
 iters = (list, tuple, set)
 
-def randstr(len, reallyrandom = False):
-    """If reallyrandom = False, generates a random alphanumeric string
-    (base-36 compatible) of length len.  If reallyrandom, add
-    uppercase and punctuation (which we'll call 'base-93' for the sake
-    of argument) and suitable for use as salt."""
-    alphabet = 'abcdefghijklmnopqrstuvwxyz0123456789'
-    if reallyrandom:
-        alphabet += 'ABCDEFGHIJKLMNOPQRSTUVWXYZ!#$%&\()*+,-./:;<=>?@[\\]^_{|}~'
-    return ''.join(random.choice(alphabet)
-                   for i in range(len))
+def randstr(length,
+            alphabet='abcdefghijklmnopqrstuvwxyz0123456789'):
+    """Return a string made up of random chars from alphabet."""
+    return ''.join(random.choice(alphabet) for _ in xrange(length))
 
 class Storage(dict):
     """
@@ -449,7 +444,7 @@ class UrlParser(object):
             q = query_string(q).lstrip('?')
 
         # make sure the port is not doubly specified
-        if self.port and ":" in self.hostname:
+        if getattr(self, 'port', None) and ":" in self.hostname:
             self.hostname = self.hostname.split(':')[0]
 
         # if there is a netloc, there had better be a scheme
@@ -551,7 +546,7 @@ class UrlParser(object):
 
             # update the domain (preserving the port)
             self.hostname = subreddit.domain
-            self.port = self.port or port
+            self.port = getattr(self, 'port', None) or port
 
             # and remove any cnameframe GET parameters
             if self.query_dict.has_key(self.cname_get):
@@ -913,59 +908,6 @@ def common_subdomain(domain1, domain2):
                 return d
     return ""
 
-def interleave_lists(*args):
-    max_len = max(len(x) for x in args)
-    for i in xrange(max_len):
-        for a in args:
-            if i < len(a):
-                yield a[i]
-
-def link_from_url(path, filter_spam = False, multiple = True):
-    from pylons import c
-    from r2.models import IDBuilder, Link, Subreddit, NotFound
-
-    if not path:
-        return
-
-    try:
-        links = Link._by_url(path, c.site)
-    except NotFound:
-        return [] if multiple else None
-
-    return filter_links(tup(links), filter_spam = filter_spam,
-                        multiple = multiple)
-
-def filter_links(links, filter_spam = False, multiple = True):
-    # run the list through a builder to remove any that the user
-    # isn't allowed to see
-    from pylons import c
-    from r2.models import IDBuilder, Link, Subreddit, NotFound
-    links = IDBuilder([link._fullname for link in links],
-                      skip = False).get_items()[0]
-    if not links:
-        return
-
-    if filter_spam:
-        # first, try to remove any spam
-        links_nonspam = [ link for link in links
-                          if not link._spam ]
-        if links_nonspam:
-            links = links_nonspam
-
-    # if it occurs in one or more of their subscriptions, show them
-    # that one first
-    subs = set(Subreddit.user_subreddits(c.user, limit = None))
-    def cmp_links(a, b):
-        if a.sr_id in subs and b.sr_id not in subs:
-            return -1
-        elif a.sr_id not in subs and b.sr_id in subs:
-            return 1
-        else:
-            return cmp(b._hot, a._hot)
-    links = sorted(links, cmp = cmp_links)
-
-    # among those, show them the hottest one
-    return links if multiple else links[0]
 
 def url_links_builder(url, exclude=None, num=None, after=None, reverse=None,
                       count=None):
@@ -977,7 +919,7 @@ def url_links_builder(url, exclude=None, num=None, after=None, reverse=None,
         url = add_sr(url, force_hostname=True)
 
     try:
-        links = tup(Link._by_url(url, None))
+        links = Link._by_url(url, None)
     except NotFound:
         links = []
 
@@ -1057,7 +999,7 @@ def to_date(d):
     return d
 
 def to_datetime(d):
-    if isinstance(d, date):
+    if type(d) == date:
         return datetime(d.year, d.month, d.day)
     return d
 
@@ -1428,9 +1370,8 @@ def weighted_lottery(weights, _random=random.random):
 
 
 def read_static_file_config(config_file):
-    parser = ConfigParser.RawConfigParser()
-    with open(config_file, "r") as cf:
-        parser.readfp(cf)
+    with open(config_file) as f:
+        parser = parse_ini_file(f)
     config = dict(parser.items("static_files"))
 
     s3 = boto.connect_s3(config["aws_access_key_id"],
@@ -1515,3 +1456,33 @@ def precise_format_timedelta(delta, locale, threshold=.85, decimals=2):
             format_string = "%." + str(decimals) + "f"
             return pattern.replace('{0}', format_string % value)
     return u''
+
+
+def parse_ini_file(config_file):
+    """Given an open file, read and parse it like an ini file."""
+
+    parser = ConfigParser.RawConfigParser()
+    parser.optionxform = str  # ensure keys are case-sensitive as expected
+    parser.readfp(config_file)
+    return parser
+
+def fuzz_activity(count):
+    """Add some jitter to an activity metric to maintain privacy."""
+    # decay constant is e**(-x / 60)
+    decay = math.exp(float(-count) / 60)
+    jitter = round(5 * decay)
+    return count + random.randint(0, jitter)
+
+# http://docs.python.org/2/library/itertools.html#recipes
+def roundrobin(*iterables):
+    "roundrobin('ABC', 'D', 'EF') --> A D E B F C"
+    # Recipe credited to George Sakkis
+    pending = len(iterables)
+    nexts = itertools.cycle(iter(it).next for it in iterables)
+    while pending:
+        try:
+            for next in nexts:
+                yield next()
+        except StopIteration:
+            pending -= 1
+            nexts = itertools.cycle(itertools.islice(nexts, pending))

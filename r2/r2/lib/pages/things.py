@@ -20,6 +20,7 @@
 # Inc. All Rights Reserved.
 ###############################################################################
 
+from r2.lib.db.thing import NotFound
 from r2.lib.menus import Styled
 from r2.lib.wrapped import Wrapped
 from r2.models import LinkListing, Link, PromotedLink
@@ -36,7 +37,7 @@ class PrintableButtons(Styled):
                  show_delete = False, show_report = True,
                  show_distinguish = False, show_marknsfw = False,
                  show_unmarknsfw = False, is_link=False,
-                 show_flair = False, **kw):
+                 show_flair = False, show_rescrape=False, **kw):
         show_ignore = thing.show_reports
         approval_checkmark = getattr(thing, "approval_checkmark", None)
         show_approve = (thing.show_spam or show_ignore or
@@ -57,6 +58,7 @@ class PrintableButtons(Styled):
                         show_marknsfw = show_marknsfw,
                         show_unmarknsfw = show_unmarknsfw,
                         show_flair = show_flair,
+                        show_rescrape=show_rescrape,
                         **kw)
         
 class BanButtons(PrintableButtons):
@@ -76,11 +78,16 @@ class LinkButtons(PrintableButtons):
             show_report = False
 
         show_marknsfw = show_unmarknsfw = False
+        show_rescrape = False
         if thing.can_ban or is_author or (thing.promoted and c.user_is_sponsor):
             if not thing.nsfw:
                 show_marknsfw = True
             elif thing.nsfw and not thing.nsfw_str:
                 show_unmarknsfw = True
+
+            if (not thing.is_self and
+                    not (thing.has_thumbnail or thing.media_object)):
+                show_rescrape = True
 
         # do we show the delete button?
         show_delete = is_author and delete and not thing._deleted
@@ -125,6 +132,7 @@ class LinkButtons(PrintableButtons):
                                   show_marknsfw = show_marknsfw,
                                   show_unmarknsfw = show_unmarknsfw,
                                   show_flair = thing.can_flair,
+                                  show_rescrape=show_rescrape,
                                   show_comments = comments,
                                   # promotion
                                   promoted = thing.promoted,
@@ -226,6 +234,17 @@ def wrap_links(links, wrapper = default_thing_wrapper(),
     b = IDBuilder(links, num = num, wrap = wrapper, **kw)
     l = listing_cls(b, nextprev = nextprev, show_nums = show_nums)
     return l.listing()
+
+
+def hot_links_by_url_listing(url, sr=None, num=None, **kw):
+    try:
+        links_for_url = Link._by_url(url, sr)
+    except NotFound:
+        links_for_url = []
+
+    links_for_url.sort(key=lambda link: link._hot, reverse=True)
+    listing = wrap_links(links_for_url, num=num, **kw)
+    return listing
 
 
 def wrap_things(*things):

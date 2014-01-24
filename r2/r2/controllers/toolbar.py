@@ -23,7 +23,7 @@
 from reddit_base import RedditController
 from r2.lib.pages import *
 from r2.models import *
-from r2.lib.pages.things import wrap_links
+from r2.lib.pages.things import hot_links_by_url_listing, wrap_links
 from r2.lib.menus import CommentSortMenu
 from r2.lib.filters import spaceCompress, safemarkdown
 from r2.lib.memoize import memoize
@@ -61,6 +61,16 @@ def demangle_url(path):
     path = utils.sanitize_url(path)
 
     return path
+
+def match_current_reddit_subdomain(url):
+    # due to X-Frame-Options: SAMEORIGIN headers, we can't frame mismatched
+    # reddit subdomains
+    parsed = UrlParser(url)
+    if parsed.is_reddit_url():
+        parsed.hostname = request.host
+        return parsed.unparse()
+    else:
+        return url
 
 def force_html():
     """Because we can take URIs like /s/http://.../foo.png, and we can
@@ -120,10 +130,12 @@ class ToolbarController(RedditController):
         else:
             thumbnail = None
 
-        res = Frame(title = link.title,
-                    url = link.url,
-                    thumbnail = thumbnail,
-                    fullname = link._fullname)
+        res = Frame(
+            title=link.title,
+            url=match_current_reddit_subdomain(link.url),
+            thumbnail=thumbnail,
+            fullname=link._fullname,
+        )
         return spaceCompress(res.render())
 
     def GET_s(self, rest):
@@ -140,7 +152,8 @@ class ToolbarController(RedditController):
         if is_shamed_domain(path)[0]:
             self.abort404()
 
-        link = utils.link_from_url(path, multiple = False)
+        listing = hot_links_by_url_listing(path, sr=c.site, num=1)
+        link = listing.things[0] if listing.things else None
 
         if c.cname and not c.authorized_cname:
             # In this case, we make some bad guesses caused by the
@@ -170,7 +183,10 @@ class ToolbarController(RedditController):
             return self.redirect(add_sr("/tb/" + link._id36))
 
         title = utils.domain(path)
-        res = Frame(title = title, url = path)
+        res = Frame(
+            title=title,
+            url=match_current_reddit_subdomain(path),
+        )
 
         # we don't want clients to think that this URL is actually a
         # valid URL for search-indexing or the like
@@ -214,25 +230,30 @@ class ToolbarController(RedditController):
               url = nop('url'))
     def GET_toolbar(self, link, url):
         """The visible toolbar, with voting buttons and all"""
-        if not link:
-            link = utils.link_from_url(url, multiple = False)
-
-        if link:
-            link = list(wrap_links(link, wrapper = FrameToolbar))
-        if link:
-            res = link[0]
-        elif url:
+        if url:
             url = demangle_url(url)
-            if not url:  # also check for validity
-                return self.abort404()
 
-            res = FrameToolbar(link = None,
-                               title = None,
-                               url = url,
-                               expanded = False)
+        if link:
+            wrapped = wrap_links(link, wrapper=FrameToolbar, num=1)
+        elif url:
+            listing = hot_links_by_url_listing(url, sr=c.site, num=1, skip=True)
+            if listing.things:
+                wrapped = listing.things[0]
+            else:
+                wrapped = None
         else:
             return self.abort404()
-        return spaceCompress(res.render())
+
+        res = None
+        if wrapped:
+            res = wrapped
+        elif url:
+            res = FrameToolbar(link=None, title=None, url=url, expanded=False)
+
+        if res:
+            return spaceCompress(res.render())
+        else:
+            return self.abort404()
 
     @validate(link = VByName('id'))
     def GET_inner(self, link):
@@ -241,7 +262,11 @@ class ToolbarController(RedditController):
         if not link:
             return self.abort404()
 
-        res = InnerToolbarFrame(link = link, expanded = auto_expand_panel(link))
+        res = InnerToolbarFrame(
+            link=link,
+            url=match_current_reddit_subdomain(link.url),
+            expanded=auto_expand_panel(link),
+        )
         return spaceCompress(res.render())
 
     @validate(link = VLink('linkoid'))

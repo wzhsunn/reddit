@@ -35,7 +35,8 @@ from r2.models.gold import (
     gold_received_by_user,
     days_to_pennies,
     gold_goal_on,
-    gold_revenue_on,
+    gold_revenue_steady,
+    gold_revenue_volatile,
     get_subscription_details,
     TIMEZONE as GOLD_TIMEZONE,
 )
@@ -85,7 +86,7 @@ from r2.lib.log import log_text
 from r2.lib.memoize import memoize
 from r2.lib.utils import trunc_string as _truncate, to_date
 from r2.lib.filters import safemarkdown
-from r2.lib.utils import Storage
+from r2.lib.utils import Storage, tup
 from r2.lib.utils import precise_format_timedelta
 
 from babel.numbers import format_currency
@@ -173,10 +174,11 @@ class Reddit(Templated):
     def __init__(self, space_compress=None, nav_menus=None, loginbox=True,
                  infotext='', content=None, short_description='', title='',
                  robots=None, show_sidebar=True, show_chooser=False,
-                 footer=True, srbar=True, page_classes=None,
+                 footer=True, srbar=True, page_classes=None, short_title=None,
                  show_wiki_actions=False, extra_js_config=None, **context):
         Templated.__init__(self, **context)
         self.title = title
+        self.short_title = short_title
         self.short_description = short_description
         self.robots = robots
         self.infotext = infotext
@@ -363,9 +365,8 @@ class Reddit(Templated):
                               _id="moderation_tools",
                               collapsible=True)
 
-    def sr_moderators(self, limit = 10):
-        accounts = Account._byID([uid
-                                  for uid in c.site.moderators[:limit]],
+    def sr_moderators(self):
+        accounts = Account._byID(c.site.moderators,
                                  data=True, return_dict=False)
         return [WrappedUser(a) for a in accounts if not a._deleted]
 
@@ -498,10 +499,12 @@ class Reddit(Templated):
         if not isinstance(c.site, FakeSubreddit) and not c.cname:
             moderators = self.sr_moderators()
             if moderators:
-                total = len(c.site.moderators)
                 more_text = mod_href = ""
-                if total > len(moderators):
-                    more_text = "...and %d more" % (total - len(moderators))
+                sidebar_list_length = 10
+                num_not_shown = len(moderators) - sidebar_list_length
+
+                if num_not_shown > 0:
+                    more_text = _("...and %d more") % (num_not_shown)
                     mod_href = "http://%s/about/moderators" % get_domain()
 
                 if '/r/%s' % c.site.name == g.admin_message_acct:
@@ -510,7 +513,8 @@ class Reddit(Templated):
                     label = _('message the moderators')
                 helplink = ("/message/compose?to=%%2Fr%%2F%s" % c.site.name,
                             label)
-                ps.append(SideContentBox(_('moderators'), moderators,
+                ps.append(SideContentBox(_('moderators'),
+                                         moderators[:sidebar_list_length],
                                          helplink = helplink,
                                          more_href = mod_href,
                                          more_text = more_text))
@@ -798,6 +802,15 @@ class SubredditInfoBar(CachedTemplate):
 
         CachedTemplate.__init__(self)
 
+    @property
+    def creator_text(self):
+        if self.sr.author:
+            if self.sr.is_moderator(self.sr.author) or self.sr.author._deleted:
+                return WrappedUser(self.sr.author).render()
+            else:
+                return self.sr.author.name
+        return None
+
     def nav(self):
         buttons = [NavButton(plurals.moderators, 'moderators')]
         if self.type != 'public':
@@ -833,8 +846,8 @@ class SideBox(CachedTemplate):
     """
     def __init__(self, title, link=None, css_class='', subtitles = [],
                  show_cover = False, nocname=False, sr_path = False,
-                 disabled=False, show_icon=True):
-        CachedTemplate.__init__(self, link = link, target = '_top',
+                 disabled=False, show_icon=True, target='_top'):
+        CachedTemplate.__init__(self, link = link, target = target,
                            title = title, css_class = css_class,
                            sr_path = sr_path, subtitles = subtitles,
                            show_cover = show_cover, nocname=nocname,
@@ -932,7 +945,7 @@ class MessagePage(Reddit):
                                                     "/message/selfreply"],
                                 sr_path = False),
                     NamedButton('sent', sr_path = False)]
-        if c.show_mod_mail:
+        if c.user_is_loggedin and c.user.is_moderator_somewhere:
             buttons.append(ModeratorMailButton(menu.modmail, "moderator",
                                                sr_path = False))
         if not c.default_sr:
@@ -1010,7 +1023,7 @@ class LoginPage(BoringPage):
         if self.dest:
             u = UrlParser(self.dest)
             # Display a preview message for OAuth2 client authorizations
-            if u.path == '/api/v1/authorize':
+            if u.path in ['/api/v1/authorize', '/api/v1/authorize.compact']:
                 client_id = u.query_dict.get("client_id")
                 self.client = client_id and OAuth2Client.get_token(client_id)
                 if self.client:
@@ -1094,7 +1107,8 @@ class OAuth2AuthorizationPage(BoringPage):
                                       duration=duration,
                                       expiration=expiration)
         BoringPage.__init__(self, _("request for permission"),
-                show_sidebar=False, content=content)
+                            show_sidebar=False, content=content,
+                            short_title=_("permission"))
 
 class OAuth2Authorization(Templated):
     pass
@@ -1703,10 +1717,10 @@ class ProfileBar(Templated):
                         self.gold_remaining = timeuntil(self.gold_expiration,
                                                         precision)
 
-                if hasattr(user, "gold_subscr_id"):
-                    self.gold_subscr_id = user.gold_subscr_id
-                if hasattr(user, "stripe_customer_id"):
-                    self.stripe_customer_id = user.stripe_customer_id
+                if user.has_paypal_subscription:
+                    self.paypal_subscr_id = user.gold_subscr_id
+                if user.has_stripe_subscription:
+                    self.stripe_customer_id = user.gold_subscr_id
 
             if ((user._id == c.user._id or c.user_is_admin) and
                 user.gold_creddits > 0):
@@ -1964,7 +1978,7 @@ class SubredditTopBar(CachedTemplate):
                 reddits.append(RandomSubscription)
             if c.user.friends:
                 reddits.append(Friends)
-            if c.show_mod_mail:
+            if c.user.is_moderator_somewhere:
                 reddits.append(Mod)
         return NavMenu([SubredditButton(sr, css_class=css_classes.get(sr))
                         for sr in reddits],
@@ -2257,7 +2271,7 @@ class GoldPayment(Templated):
 
 class GoldSubscription(Templated):
     def __init__(self, user):
-        if hasattr(user, 'stripe_customer_id'):
+        if user.has_stripe_subscription:
             details = get_subscription_details(user)
         else:
             details = None
@@ -2280,10 +2294,9 @@ class GoldSubscription(Templated):
         else:
             self.has_stripe_subscription = False
 
-        paypal_subscr_id = getattr(user, 'gold_subscr_id', None)
-        if paypal_subscr_id:
+        if user.has_paypal_subscription:
             self.has_paypal_subscription = True
-            self.paypal_subscr_id = paypal_subscr_id
+            self.paypal_subscr_id = user.gold_subscr_id
             self.paypal_url = "https://www.paypal.com/cgi-bin/webscr?cmd=_subscr-find&alias=%s" % g.goldthanks_email
         else:
             self.has_paypal_subscription = False
@@ -3549,16 +3562,49 @@ class PromoteLinkForm(Templated):
 
         self.subreddit_selector = SubredditSelector()
 
-        self.link = promote.wrap_promoted(link)
+        self.link = link
         self.listing = listing
         campaigns = PromoCampaign._by_link(link._id)
-        self.campaigns = promote.get_renderable_campaigns(link, campaigns)
+        self.campaigns = RenderableCampaign.from_campaigns(link, campaigns)
         self.promotion_log = PromotionLog.get(link)
 
         self.min_bid = 0 if c.user_is_sponsor else g.min_promote_bid
 
         self.priorities = [(p.name, p.text, p.description, p.default, p.inventory_override, p.cpm)
                            for p in sorted(PROMOTE_PRIORITIES.values(), key=lambda p: p.value)]
+
+        # geotargeting
+        def location_sort(location_tuple):
+            code, name, default = location_tuple
+            if code == '':
+                return -2
+            elif code == 'US':
+                return -1
+            else:
+                return name
+
+        countries = [(code, country['name'], False) for code, country
+                                                    in g.locations.iteritems()]
+        countries.append(('', _('none'), True))
+
+        self.countries = sorted(countries, key=location_sort)
+        self.regions = {}
+        self.metros = {}
+        for code, country in g.locations.iteritems():
+            if 'regions' in country and country['regions']:
+                self.regions[code] = [('', _('all'), True)]
+
+                for region_code, region in country['regions'].iteritems():
+                    if region['metros']:
+                        region_tuple = (region_code, region['name'], False)
+                        self.regions[code].append(region_tuple)
+                        self.metros[region_code] = []
+
+                        for metro_code, metro in region['metros'].iteritems():
+                            metro_tuple = (metro_code, metro['name'], False)
+                            self.metros[region_code].append(metro_tuple)
+                        self.metros[region_code].sort(key=location_sort)
+                self.regions[code].sort(key=location_sort)
 
         # preload some inventory
         srnames = set()
@@ -3580,12 +3626,73 @@ class PromoteLinkForm(Templated):
         self.infobar = InfoBar(message=message)
 
 
+class RenderableCampaign(Templated):
+    def __init__(self, link, campaign, transaction, is_pending, is_live,
+                 is_complete):
+        self.link = link
+        self.campaign = campaign
+        self.spent = promote.get_spent_amount(campaign)
+        self.paid = bool(transaction and not transaction.is_void())
+        self.free = campaign.is_freebie()
+        self.is_pending = is_pending
+        self.is_live = is_live
+        self.is_complete = is_complete
+        self.needs_refund = (is_complete and c.user_is_sponsor and
+                             not transaction.is_refund() and
+                             self.spent < campaign.bid)
+        self.pay_url = promote.pay_url(link, campaign)
+        self.view_live_url = promote.view_live_url(link, campaign.sr_name)
+        self.refund_url = promote.refund_url(link, campaign)
+
+        if campaign.location:
+            country = campaign.location.country or ''
+            region = campaign.location.region or ''
+            metro = campaign.location.metro or ''
+            pieces = [country, region]
+            if metro:
+                metro_str = (g.locations[country]['regions'][region]
+                             ['metros'][metro]['name'])
+                pieces.append(metro_str)
+            pieces = filter(lambda i: i, pieces)
+            self.geotarget = '/'.join(pieces)
+            self.country, self.region, self.metro = country, region, metro
+        else:
+            self.geotarget = ''
+            self.country, self.region, self.metro = '', '', ''
+
+        Templated.__init__(self)
+
+    @classmethod
+    def from_campaigns(cls, link, campaigns):
+        campaigns, is_single = tup(campaigns, ret_is_single=True)
+        transactions = promote.get_transactions(link, campaigns)
+        live_campaigns = promote.live_campaigns_by_link(link)
+        today = promote.promo_datetime_now().date()
+
+        ret = []
+        for camp in campaigns:
+            transaction = transactions.get(camp._id)
+            is_pending = today < to_date(camp.start_date)
+            is_live = camp in live_campaigns
+            is_complete = (transaction and (transaction.is_charged() or
+                                            transaction.is_refund()) and
+                           not (is_live or is_pending))
+            rc = cls(link, camp, transaction, is_pending, is_live, is_complete)
+            ret.append(rc)
+        if is_single:
+            return ret[0]
+        else:
+            return ret
+
+    def render_html(self):
+        return spaceCompress(self.render(style='html'))
+
+
 class RefundPage(Reddit):
     def __init__(self, link, campaign):
         self.link = link
         self.campaign = campaign
-        self.listing = wrap_links(link, wrapper=promote.sponsor_wrapper,
-                                  skip=False)
+        self.listing = wrap_links(link, skip=False)
         billable_impressions = promote.get_billable_impressions(campaign)
         billable_amount = promote.get_billable_amount(campaign,
                                                       billable_impressions)
@@ -3769,8 +3876,15 @@ class MediaEmbedBody(CachedTemplate):
 
 class PaymentForm(Templated):
     def __init__(self, link, campaign, **kw):
-        self.link = promote.wrap_promoted(link)
-        self.campaign = promote.get_renderable_campaigns(link, campaign)
+        self.link = link
+        self.duration = strings.time_label
+        self.duration %= {'num': campaign.ndays,
+                          'time': ungettext("day", "days", campaign.ndays)}
+        self.start_date = campaign.start_date.strftime("%m/%d/%Y")
+        self.end_date = campaign.end_date.strftime("%m/%d/%Y")
+        self.campaign_id36 = campaign._id36
+        self.budget = format_currency(float(campaign.bid), 'USD',
+                                      locale=c.locale)
         Templated.__init__(self, **kw)
 
 class Promotion_Summary(Templated):
@@ -3910,8 +4024,8 @@ class PromoteReport(Templated):
             p = request.GET.copy()
             self.csv_url = '%s.csv?%s' % (request.path, urlencode(p))
         else:
-            self.link_report = None
-            self.campaign_report = None
+            self.link_report = []
+            self.campaign_report = []
             self.csv_url = None
 
         Templated.__init__(self, link_text=link_text, owner_name=owner_name,
@@ -3998,7 +4112,7 @@ class PromoteReport(Templated):
             campaign_start = campaign.start_date - promote.timezone_offset
             campaign_end = campaign.end_date - promote.timezone_offset
             date = date.replace(tzinfo=g.tz)
-            if date < campaign_start or date > campaign_end:
+            if not (campaign_start <= date < campaign_end):
                 continue
             if sr == '':
                 fp_hits[codename] += pageviews
@@ -4059,8 +4173,8 @@ class PromoteReport(Templated):
         self.campaign_report = sorted(campaign_report, key=lambda r: r['link'])
 
 class InnerToolbarFrame(Templated):
-    def __init__(self, link, expanded = False):
-        Templated.__init__(self, link = link, expanded = expanded)
+    def __init__(self, link, url, expanded=False):
+        Templated.__init__(self, link=link, url=url, expanded=expanded)
 
 class RawString(Templated):
    def __init__(self, s):
@@ -4093,7 +4207,7 @@ class AccountActivityPage(BoringPage):
 
 class UserIPHistory(Templated):
     def __init__(self):
-        self.my_apps = OAuth2Client._by_user(c.user)
+        self.my_apps = OAuth2Client._by_user_grouped(c.user)
         self.ips = ips_by_account_id(c.user._id)
         super(UserIPHistory, self).__init__()
 
@@ -4141,11 +4255,11 @@ class Goldvertisement(Templated):
                                      tomorrow.month,
                                      tomorrow.day,
                                      tzinfo=GOLD_TIMEZONE)
-        revenue_today = gold_revenue_on(today)
+        revenue_today = gold_revenue_volatile(today)
         yesterday = today - datetime.timedelta(days=1)
-        revenue_yesterday = gold_revenue_on(yesterday)
-        revenue_goal = gold_goal_on(today)
-        revenue_goal_yesterday = gold_goal_on(yesterday)
+        revenue_yesterday = gold_revenue_steady(yesterday)
+        revenue_goal = float(gold_goal_on(today))
+        revenue_goal_yesterday = float(gold_goal_on(yesterday))
 
         self.percent_filled = int((revenue_today / revenue_goal) * 100)
         self.percent_filled_yesterday = int((revenue_yesterday /
@@ -4182,9 +4296,10 @@ class ListingChooser(Templated):
         self.sections = defaultdict(list)
         self.add_item("global", _("subscribed"), site=Frontpage,
                       description=_("your front page"))
+        self.add_item("global", _("explore"), path="/explore")
         self.add_item("other", _("everything"), site=All,
                       description=_("from all subreddits"))
-        if c.show_mod_mail:
+        if c.user_is_loggedin and c.user.is_moderator_somewhere:
             self.add_item("other", _("moderating"), site=Mod,
                           description=_("subreddits you mod"))
 
@@ -4273,9 +4388,12 @@ class PolicyPage(BoringPage):
 
 
 class SubscribeButton(Templated):
-    def __init__(self, sr):
+    def __init__(self, sr, bubble_class=None):
         Templated.__init__(self)
         self.sr = sr
+        self.data_attrs = {"sr_name": sr.name}
+        if bubble_class:
+            self.data_attrs["bubble_class"] = bubble_class
 
 
 class SubredditSelector(Templated):
@@ -4331,4 +4449,42 @@ class ListingSuggestions(Templated):
             else:
                 self.suggestion_type = "random"
 
+        Templated.__init__(self)
+
+
+class ExploreItem(Templated):
+    """For managing recommended content."""
+
+    def __init__(self, item_type, rec_src, sr, link, comment=None):
+        """Constructor.
+
+        item_type - string that helps templates know how to render this item.
+        rec_src - code that lets us track where the rec originally came from,
+            useful for comparing performance of data sources or algorithms
+        sr and link are required
+        comment is optional
+        
+        See r2.lib.recommender for valid values of item_type and rec_src.
+
+        """
+        self.sr = sr
+        self.link = link
+        self.comment = comment
+        self.type = item_type
+        self.src = rec_src
+        Templated.__init__(self)
+
+
+class ExploreItemListing(Templated):
+    def __init__(self, recs):
+        self.things = []
+        if recs:
+            links, srs = zip(*[(rec.link, rec.sr) for rec in recs])
+            wrapped_links = {l._id: l for l in wrap_links(links).things}
+            wrapped_srs = {sr._id: sr for sr in wrap_things(*srs)}
+            for rec in recs:
+                if rec.link._id in wrapped_links:
+                    rec.link = wrapped_links[rec.link._id]
+                    rec.sr = wrapped_srs[rec.sr._id]
+                    self.things.append(rec)
         Templated.__init__(self)

@@ -371,7 +371,7 @@ class LocalizedModule(Module):
         from r2.lib.template_helpers import static
 
         if g.uncompressedJS:
-            if c.lang == "en":
+            if c.lang == "en" or c.lang not in g.all_languages:
                 # in this case, the msgids *are* the translated strings and we
                 # can save ourselves the pricey step of lexing the js source
                 return Module.use(self)
@@ -387,11 +387,6 @@ class LocalizedModule(Module):
             langs = get_lang() or [g.lang]
             url = LocalizedModule.languagize_path(self.name, langs[0])
             return script_tag.format(src=static(url))
-
-    @property
-    def dependencies(self):
-        return (super(LocalizedModule, self).dependencies
-               + [os.path.join(REDDIT_ROOT, "lib/strings.py")])
 
     @property
     def outputs(self):

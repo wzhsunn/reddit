@@ -67,6 +67,7 @@ class Link(Thing, Printable):
         'num_comments', 'reported', 'comment_tree_id')
     _defaults = dict(is_self=False,
                      over_18=False,
+                     over_18_override=False,
                      nsfw_str=False,
                      reported=0, num_comments=0,
                      moderator_banned=False,
@@ -114,13 +115,10 @@ class Link(Thing, Printable):
 
         links = Link._byID36(link_id36s, data=True, return_dict=False)
         links = [l for l in links if not l._deleted]
+        if sr:
+            links = [link for link in links if link.sr_id == sr._id]
 
-        if links and sr:
-            for link in links:
-                if sr._id == link.sr_id:
-                    # n.b. returns the first one if there are multiple
-                    return link
-        elif links:
+        if links:
             return links
 
         raise NotFound('Link "%s"' % url)
@@ -786,7 +784,12 @@ class Comment(Thing, Printable):
                     ip=ip,
                     **kw)
 
-        c._spam = author._spam
+        # whitelist promoters commenting on their own promoted links
+        from r2.lib import promote
+        if promote.is_promo(link) and link.author_id == author._id:
+            c._spam = False
+        else:
+            c._spam = author._spam
 
         if author._spam:
             g.stats.simple_event('spam.autoremove.comment')
@@ -1065,9 +1068,9 @@ class Comment(Thing, Printable):
                 extra_css += " border"
 
             if profilepage:
-                if not item.link._deleted or user_is_admin:
-                    link_author = authors[item.link.author_id]
-                else:
+                link_author = authors[item.link.author_id]
+                if ((item.link._deleted or link_author._deleted) and
+                        not user_is_admin):
                     link_author = DeletedUser()
                 item.link_author = WrappedUser(link_author)
 
@@ -1848,7 +1851,7 @@ class ModeratorInbox(Relation(Subreddit, Message)):
                       if perms.get('mail', False))
         moderators = Account._byID(mod_ids, data=True, return_dict=False)
         for m in moderators:
-            if obj.author_id != m._id and not getattr(m, 'modmsgtime', None):
+            if obj.author_id != m._id and not m.modmsgtime:
                 m.modmsgtime = obj._date
                 m._commit()
 

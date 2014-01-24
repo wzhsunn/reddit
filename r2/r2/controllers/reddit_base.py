@@ -93,6 +93,8 @@ from r2.models import (
     Frontpage,
     LabeledMulti,
     Link,
+    Mod,
+    ModMinus,
     MultiReddit,
     NotFound,
     Random,
@@ -371,14 +373,24 @@ def set_subreddit():
                 c.site = MultiReddit(multi_path, srs)
     elif '-' in sr_name:
         sr_names = sr_name.split('-')
-        if not sr_names[0].lower() == All.name.lower():
-            redirect_to("/subreddits/search?q=%s" % sr_name)
-        srs = Subreddit._by_name(sr_names[1:], stale=can_stale).values()
-        srs = [sr for sr in srs if not isinstance(sr, FakeSubreddit)]
-        if not srs:
-            c.site = All
+        base_sr_name, exclude_sr_names = sr_names[0], sr_names[1:]
+        srs = Subreddit._by_name(sr_names, stale=can_stale)
+        base_sr = srs.pop(base_sr_name, None)
+        exclude_srs = [sr for sr in srs.itervalues()
+                          if not isinstance(sr, FakeSubreddit)]
+
+        if base_sr == All:
+            if exclude_srs:
+                c.site = AllMinus(exclude_srs)
+            else:
+                c.site = All
+        elif base_sr == Mod:
+            if exclude_srs:
+                c.site = ModMinus(exclude_srs)
+            else:
+                c.site = Mod
         else:
-            c.site = AllMinus(srs)
+            redirect_to("/subreddits/search?q=%s" % sr_name)
     else:
         try:
             c.site = Subreddit._by_name(sr_name, stale=can_stale)
@@ -599,7 +611,9 @@ def paginated_listing(default_page_size=25, max_page_size=100, backend='sql'):
                   before=VByName('before', backend=backend),
                   count=VCount('count'),
                   target=VTarget("target"),
-                  show=VLength('show', 3, empty_error=None))
+                  show=VLength('show', 3, empty_error=None,
+                               docs={"show": "(optional) the string `all`"}),
+        )
         @wraps(fn)
         def new_fn(self, before, **env):
             if c.render_style == "htmllite":
@@ -618,8 +632,14 @@ def paginated_listing(default_page_size=25, max_page_size=100, backend='sql'):
                 kw['reverse'] = True
 
             return fn(self, **kw)
+
+        if hasattr(fn, "_api_doc"):
+            fn._api_doc["notes"] = paginated_listing.doc_note
+
         return new_fn
     return decorator
+
+paginated_listing.doc_note = "*This endpoint is [a listing](#listings).*"
 
 #TODO i want to get rid of this function. once the listings in front.py are
 #moved into listingcontroller, we shouldn't have a need for this
@@ -667,13 +687,11 @@ def require_https():
     if not c.secure:
         abort(ForbiddenError(errors.HTTPS_REQUIRED))
 
-def prevent_framing_and_css(allow_cname_frame=False):
+def disable_subreddit_css():
     def wrap(f):
         @wraps(f)
         def no_funny_business(*args, **kwargs):
             c.allow_styles = False
-            if not (allow_cname_frame and c.cname and not c.authorized_cname):
-                c.deny_frames = True
             return f(*args, **kwargs)
         return no_funny_business
     return wrap
@@ -755,6 +773,7 @@ class MinimalController(BaseController):
             ratelimit_agents()
 
         c.allow_loggedin_cache = False
+        c.allow_framing = False
 
         # the domain has to be set before Cookies get initialized
         set_subreddit()
@@ -788,7 +807,13 @@ class MinimalController(BaseController):
         c.can_use_pagecache = self.can_use_pagecache()
 
         if request.method.upper() == 'GET' and c.can_use_pagecache:
-            r = g.pagecache.get(self.request_key())
+            request_key = self.request_key()
+            try:
+                r = g.pagecache.get(request_key)
+            except MemcachedError as e:
+                g.log.warning("pagecache error: %s", e)
+                return
+
             if r:
                 r, c.cookies = r
                 response.headers = r.headers
@@ -818,8 +843,14 @@ class MinimalController(BaseController):
             response.headers['Cache-Control'] = 'no-cache'
             response.headers['Pragma'] = 'no-cache'
 
-        if c.deny_frames:
-            response.headers["X-Frame-Options"] = "DENY"
+        # pagecache stores headers. we need to not add X-Frame-Options to
+        # cached requests (such as media embeds) that intend to allow framing.
+        if not c.allow_framing and not c.used_cache:
+            response.headers["X-Frame-Options"] = "SAMEORIGIN"
+
+        # set some headers related to client security
+        response.headers['X-Content-Type-Options'] = 'nosniff'
+        response.headers['X-XSS-Protection'] = '1; mode=block'
 
         # save the result of this page to the pagecache if possible.  we
         # mustn't cache things that rely on state not tracked by request_key
@@ -1041,14 +1072,15 @@ class RedditController(MinimalController):
             c.modhash = c.user.modhash()
             if hasattr(c.user, 'msgtime') and c.user.msgtime:
                 c.have_messages = c.user.msgtime
-            c.show_mod_mail = Subreddit.reverse_moderator_ids(c.user)
-            c.have_mod_messages = getattr(c.user, "modmsgtime", False)
+            c.have_mod_messages = bool(c.user.modmsgtime)
             c.user_is_admin = maybe_admin and c.user.name in g.admins
             c.user_special_distinguish = c.user.special_distinguish()
             c.user_is_sponsor = c.user_is_admin or c.user.name in g.sponsors
             c.otp_cached = is_otpcookie_valid
             if not isinstance(c.site, FakeSubreddit) and not g.disallow_db_writes:
                 c.user.update_sr_activity(c.site)
+
+        c.request_timer.intermediate("base-auth")
 
         c.over18 = over18()
         set_obey_over18()
@@ -1148,6 +1180,16 @@ class RedditController(MinimalController):
     def post(self):
         MinimalController.post(self)
         self._embed_html_timing_data()
+
+        # allow logged-out JSON requests to be read cross-domain
+        if (request.method.upper() == "GET" and not c.user_is_loggedin and
+            c.render_style == "api"):
+            response.headers["Access-Control-Allow-Origin"] = "*"
+
+            request_origin = request.headers.get('Origin')
+            if request_origin and request_origin != g.origin:
+                g.stats.simple_event('cors.api_request')
+                g.stats.count_string('origins', request_origin)
 
     def _embed_html_timing_data(self):
         timings = g.stats.end_logging_timings()

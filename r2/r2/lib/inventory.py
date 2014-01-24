@@ -32,12 +32,13 @@ from r2.lib.memoize import memoize
 from r2.lib.utils import to_date, tup
 from r2.models import (
     Bid,
+    Location,
     PromoCampaign,
     PromotionWeights,
     NO_TRANSACTION,
     traffic,
 )
-from r2.models.promo_metrics import PromoMetrics
+from r2.models.promo_metrics import LocationPromoMetrics, PromoMetrics
 from r2.models.subreddit import DefaultSR
 
 NDAYS_TO_QUERY = 14  # how much history to use in the estimate
@@ -111,10 +112,18 @@ def get_campaigns_by_date(srs, start, end, ignore=None):
     campaigns = PromoCampaign._byID(campaign_ids, data=True, return_dict=False)
     transaction_ids = {camp.trans_id for camp in campaigns
                                      if camp.trans_id != NO_TRANSACTION}
-    transactions = Bid.query().filter(Bid.transaction.in_(transaction_ids))
-    transaction_by_id = {bid.transaction: bid for bid in transactions}
 
-    ret = {sr.name: defaultdict(list) for sr in srs}
+    if transaction_ids:
+        transactions = Bid.query().filter(Bid.transaction.in_(transaction_ids))
+        transaction_by_id = {bid.transaction: bid for bid in transactions}
+    else:
+        transaction_by_id = {}
+
+    ret = {sr.name: dict.fromkeys(dates) for sr in srs}
+    for srname, date_dict in ret.iteritems():
+        for date in date_dict:
+            ret[srname][date] = []
+
     for camp in campaigns:
         if camp.trans_id == NO_TRANSACTION:
             continue
@@ -175,8 +184,83 @@ def get_predicted_pageviews(srs, start, end):
         return ret
 
 
-def get_available_pageviews(srs, start, end, datestr=False,
-                            ignore=None):
+def get_predicted_geotargeted(sr, location, start, end):
+    """
+    Predicted geotargeted impressions are estimated as:
+
+    geotargeted impressions = (predicted untargeted impressions) *
+                                 (fp impressions for location / fp impressions)
+
+    """
+
+    sr_inventory_by_date = get_predicted_pageviews(sr, start, end)
+
+    no_location = Location(None)
+    r = LocationPromoMetrics.get(DefaultSR, [no_location, location])
+    ratio = r[(DefaultSR, location)] / float(r[(DefaultSR, no_location)])
+
+    ret = {}
+    for date, sr_inventory in sr_inventory_by_date.iteritems():
+        ret[date] = int(sr_inventory * ratio)
+    return ret
+
+
+def get_available_pageviews_geotargeted(sr, location, start, end, datestr=False, 
+                                        ignore=None):
+    """
+    Return the available pageviews by date for the subreddit and location.
+
+    Available pageviews depends on all equal and higher level targets:
+    A target is: subreddit > country > metro
+
+    e.g. if a campaign is targeting /r/funny in USA/Boston we need to check that
+    there's enough inventory in:
+    * /r/funny (all campaigns targeting /r/funny regardless of geotargeting)
+    * /r/funny + USA (all campaigns targeting /r/funny and USA with or without
+      metro level targeting)
+    * /r/funny + USA + Boston (all campaigns targeting /r/funny and USA and
+      Boston)
+    The available inventory is the smallest of these values.
+
+    """
+
+    predicted_by_location = {
+        None: get_predicted_pageviews(sr, start, end),
+        location: get_predicted_geotargeted(sr, location, start, end),
+    }
+
+    if location.metro:
+        country_location = Location(country=location.country)
+        country_prediction = get_predicted_geotargeted(sr, country_location,
+                                                       start, end)
+        predicted_by_location[country_location] = country_prediction
+
+    datekey = lambda dt: dt.strftime('%m/%d/%Y') if datestr else dt
+
+    ret = {}
+    campaigns_by_date = get_campaigns_by_date(sr, start, end, ignore)
+    for date, campaigns in campaigns_by_date.iteritems():
+
+        # calculate sold impressions for each location
+        sold_by_location = dict.fromkeys(predicted_by_location.keys(), 0)
+        for camp in campaigns:
+            daily_impressions = camp.impressions / camp.ndays
+            for location in predicted_by_location:
+                if not location or location.contains(camp.location):
+                    sold_by_location[location] += daily_impressions
+
+        # calculate available impressions for each location
+        available_by_location = dict.fromkeys(predicted_by_location.keys(), 0)
+        for location, predictions_by_date in predicted_by_location.iteritems():
+            predicted = predictions_by_date[date]
+            sold = sold_by_location[location]
+            available_by_location[location] = predicted - sold
+
+        ret[datekey(date)] = max(0, min(available_by_location.values()))
+    return ret
+
+
+def get_available_pageviews(srs, start, end, datestr=False, ignore=None):
     srs, is_single = tup(srs, ret_is_single=True)
     pageviews_by_sr_by_date = get_predicted_pageviews(srs, start, end)
     sold_by_sr_by_date = get_sold_pageviews(srs, start, end, ignore)
@@ -200,9 +284,13 @@ def get_available_pageviews(srs, start, end, datestr=False,
         return ret
 
 
-def get_oversold(sr, start, end, daily_request, ignore=None):
-    available_by_date = get_available_pageviews(sr, start, end, datestr=True,
-                                                ignore=ignore)
+def get_oversold(sr, start, end, daily_request, ignore=None, location=None):
+    if location:
+        available_by_date = get_available_pageviews_geotargeted(sr, location,
+                                start, end, datestr=True, ignore=ignore)
+    else:
+        available_by_date = get_available_pageviews(sr, start, end,
+                                                    datestr=True, ignore=ignore)
     oversold = {}
     for datestr, available in available_by_date.iteritems():
         if available < daily_request:

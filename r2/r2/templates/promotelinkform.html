@@ -21,7 +21,6 @@
 ###############################################################################
 
 <%!
-  from r2.lib.utils import to36
   from r2.lib.media import thumbnail_url
   from r2.lib.template_helpers import static
   from r2.lib import promote
@@ -42,8 +41,11 @@ ${unsafe(js.use('sponsored'))}
 
 <%def name="javascript_setup()">
 <script type="text/javascript">
-  r.sponsored.init(${unsafe(simplejson.dumps(c.user_is_sponsor))});
-  r.sponsored.setup(${unsafe(simplejson.dumps(thing.inventory))})
+  r.sponsored.init();
+  r.sponsored.setup(${unsafe(simplejson.dumps(thing.inventory))},
+                    ${simplejson.dumps(not thing.campaigns)});
+  r.sponsored.setup_geotargeting(${unsafe(simplejson.dumps(thing.regions))},
+                                 ${unsafe(simplejson.dumps(thing.metros))});
 </script>
 </%def>
 
@@ -80,7 +82,7 @@ ${unsafe(js.use('sponsored'))}
     ${campaign_dashboard()}
 
     <div class="pretty-form" id="promo-form">
-      <input type="hidden" name="link_id" value="${to36(thing.link._id)}"/>
+      <input type="hidden" name="link_id36" value="${thing.link._id36}">
 
       <%
          trusted = c.user_is_sponsor or c.user.trusted_sponsor
@@ -130,7 +132,7 @@ ${self.javascript_setup()}
               wrap="hard" class="rounded">${link.title if link else ''}</textarea>
     ${error_field("NO_TEXT", "title", "div")}
     ${error_field("TOO_LONG", "title", "div")}
-    <div class="infotext rounded">
+    <div class="help infotext rounded">
       <p>${_("A good title is important to the success of your campaign. reddit users are an intelligent, thoughtful group, and reward those who engage them.")}</p>
     </div>
   </%utils:line_field>
@@ -162,8 +164,7 @@ ${self.javascript_setup()}
     ${error_field("NO_URL", "url", "div")}
     ${error_field("BAD_URL", "url", "div")}
     ${error_field("DOMAIN_BANNED", "url", "div")}
-    ${error_field("ALREADY_SUB", "url", "div")}
-    <div class="infotext rounded">
+    <div class="help infotext rounded">
       <p>${_("Provide the URL of your ad. No redirects please!")}</p>
     </div>
 
@@ -200,7 +201,7 @@ ${self.javascript_setup()}
                            current_image="${getattr(link, 'thumbnail_url', '')}"
                            label="${_('upload header image:')}"
                            ask_type="True">
-        <input type="hidden" name="link_id" value="${link._fullname}" />
+        <input type="hidden" name="link_name" value="${link._fullname}" />
 
         ## overwrite the completed image function
         <script type="text/javascript">
@@ -227,7 +228,7 @@ ${self.javascript_setup()}
       <br />
     </div>
 
-    <div class="infotext rounded">
+    <div class="help infotext rounded">
       <p>${_("Comments are a great way to get feedback from customers, and the reddit community is known for being vocal in comment threads.")}</p>
     </div>
   </%utils:line_field>
@@ -292,13 +293,13 @@ ${self.javascript_setup()}
            class="campaign infotext rounded"
            method="post" action="/api/add_campaign">
 
-        <input type="hidden" name="link_id" value="${to36(thing.link._id)}"/>
+        <input type="hidden" name="link_id36" value="${thing.link._id36}">
 
         <%
             start_title = _("Date when your sponsored link will start running.  We start new campaigns at midnight UTC+5")
             end_title = _("Date when your sponsored link will end (at midnight UTC+5)")
             targeting_title = _("name of the community that you are targeting. A blank entry here means that the ad is untargeted and will run site-wide ")
-            newcamp_title = _("click to create a new campaign.  To edit an existing campaing in the table below, click the 'edit' button.")
+            newcamp_title = _("click to create a new campaign.  To edit an existing campaign in the table below, click the 'edit' button.")
          %>
 
         <table class="preftable">
@@ -336,10 +337,31 @@ ${self.javascript_setup()}
             </td>
           </tr>
 
+          <tr style="${'display:none' if not c.user_is_sponsor else ''}">
+            <th>${_("geotargeting")}</th>
+            <td class="prefright">
+              <select class="geotarget-select" id="country" name="country"
+                      title=${_("country")}
+                      onchange="r.sponsored.country_changed()">
+                %for code, name, selected in thing.countries:
+                <option ${"selected='selected'" if selected else ""} value=${code}>
+                  ${name}
+                </option>
+                %endfor
+              </select>
+              <select class="geotarget-select" id="region" name="region"
+                      title=${_("region")} style="display:none"
+                      onchange="r.sponsored.region_changed()"></select>
+              <select class="geotarget-select" id="metro" name="metro"
+                      title=${_("metro")} style="display:none"
+                      onchange="r.sponsored.metro_changed()"></select>
+              ${error_field("INVALID_LOCATION", ("country", "region", "metro"), "div")}
+            </td>
+          </tr>
+
           <tr>
             <th>${_("price")}</th>
             <td class="prefright">
-              <input id="cpm" name="cpm" value="${thing.author.cpm_selfserve_pennies}" type="hidden">
               <span class="price-info"></span>
             </td>
           </tr>
@@ -347,15 +369,15 @@ ${self.javascript_setup()}
           <tr style="${'display:none' if not c.user_is_sponsor else ''}">
             <th>${_("priority")}</th>
             <td class="prefright">
-              %for value, text, description, default, inventory_override, cpm in thing.priorities:
+              %for value, text, description, default, override, cpm in thing.priorities:
               <label>
                 <input id="${value}" class="nomargin" 
                        type="radio"  value="${value}" name="priority"
                        onclick="r.sponsored.priority_changed()"
                        ${"checked='checked'" if default else ""}
-                       ${"default='default'" if default else ""}
-                       ${"override='override'" if inventory_override else ""}
-                       ${"cpm='cpm'" if cpm else ""}>
+                       data-default="${simplejson.dumps(default)}"
+                       data-override="${simplejson.dumps(override)}"
+                       data-cpm="${simplejson.dumps(cpm)}">
                        %if description:
                        <span>${"%s (%s)" % (text, description)}</span>
                        %else:
@@ -379,7 +401,8 @@ ${self.javascript_setup()}
                       onkeyup="r.sponsored.on_bid_change()"
                       value="${format_decimal(5 * thing.min_bid, format='.00', locale=c.locale)}"
                       data-min_bid="${thing.min_bid}"
-                      data-base_cpm="${thing.author.cpm_selfserve_pennies}"/>
+                      data-base_cpm="${thing.author.cpm_selfserve_pennies}"
+                      data-geotarget_cpm="${thing.author.cpm_selfserve_pennies + g.cpm_selfserve_geotarget.pennies}"/>
               <div class="minimum-spend">
                 ${_('%(minimum)s minimum') % dict(minimum=format_currency(thing.min_bid, 'USD', locale=c.locale))}
               </div>
@@ -414,18 +437,6 @@ ${self.javascript_setup()}
                        onclick="r.sponsored.targeting_on()">
                 ${_("targeted (targets a subreddit and its subscribers)")}
               </label>
-
-              <script type="text/javascript">
-                $(function() { 
-                    var c =  $(".campaign input[name=targeting]:checked");
-                    if (c.val() == 'one') {
-                      r.sponsored.targeting_on();
-                    } else {
-                      r.sponsored.targeting_off();
-                    }
-                  })
-              </script>
-
             </td>
           </tr>
         </table>
@@ -453,7 +464,8 @@ ${self.javascript_setup()}
         </div>
 
         <div class="buttons">
-          <input type="hidden" name="campaign_id36" value="" />
+          <input type="hidden" name="campaign_id36" value="">
+          <input type="hidden" name="campaign_name" value="">
           <span class="status error"></span>
           <button name="cancel"
                   onclick="return cancel_edit()" class="fancybutton">
@@ -492,10 +504,15 @@ ${self.javascript_setup()}
             <th title="${start_title}">${_("start")}</th>
             <th title="${end_title}">${_("end")}</th>
             <th>${_("duration")}</th>
-            <th>${_("priority")}</th>
+            <th style="${'display:none' if not c.user_is_sponsor else ''}">
+              ${_("priority")}
+            </th>
             <th>${_("total budget")}</th>
             <th>${_("spent")}</th>
             <th title="${targeting_title}">${_("targeting")}</th>
+            <th style="${'display:none' if not c.user_is_sponsor else ''}">
+              ${_("geotargeting")}
+            </th>
             <th style="align:right">
               <button class="new-campaign fancybutton" 
                       ${'disabled="disabled"' if len(thing.campaigns) >= g.MAX_CAMPAIGNS_PER_LINK else ''}
@@ -503,19 +520,10 @@ ${self.javascript_setup()}
                       onclick="return create_campaign()">+ add new</button>
             </th>
           </tr>
+          %for camp in thing.campaigns:
+            ${camp}
+          %endfor
         </table>
-
-        <script type="text/javascript">
-          $(function() {
-              %for rc in sorted(thing.campaigns, key=lambda rc: rc.start_date):
-                $.new_campaign(${unsafe(','.join(simplejson.dumps(attr) for attr in
-                    [rc.campaign_id36, rc.start_date, rc.end_date, rc.duration,
-                     rc.bid, rc.spent, rc.cpm, rc.sr, rc.priority_name,
-                     rc.inventory_override, rc.status]))});
-              %endfor
-              $.set_up_campaigns();
-            });
-        </script>
 
         <p class="error"
            style="${'display:none' if thing.campaigns else ''}">

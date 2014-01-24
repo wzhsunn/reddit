@@ -196,11 +196,17 @@
 <%def name="scope_details(scope, compact=False, expiration=None)">
   <div class="app-permissions">
     <ul>
-      %if not compact and scope.subreddit_only:
-        <li>
-          ${_("Only in the subreddits:")}&#32;
-          ${sr_list(scope.subreddits)}.
-        </li>
+      %if scope.subreddit_only:
+        %if compact:
+	  ${_("Only in:")}&#32;
+	  ${sr_list(scope.subreddits)}
+	  <br>
+	%else:
+          <li>
+            ${_("Only in the subreddits:")}&#32;
+            ${sr_list(scope.subreddits)}.
+          </li>
+	%endif
       %endif
       %for name, scope_info in scope.details():
         <li>
@@ -224,43 +230,39 @@
         </li>
       %endif
     </ul>
-    %if compact and (scope.subreddit_only or expiration):
+    %if compact and expiration:
       <div class="app-permissions-details">
-      %if scope.subreddit_only:
-        ${_("Only in:")}&#32;
-        ${sr_list(scope.subreddits)}
-        <br>
-      %endif
-      %if expiration:
         ${_("Expires in:")}&#32;
         ${timeuntil(expiration)}
         <br>
-      %endif
       </div>
     %endif
   </div>
 </%def>
 
-<%def name="authorized_app(app, scope, expiration)">
-  <div id="authorized-app-${app._id}" class="authorized-app rounded">
-    ${icon(app)}
+<%def name="authorized_app(app_data)">
+  <div id="authorized-app-${app_data['client']._id}" class="authorized-app rounded">
+    ${icon(app_data['client'])}
     <div class="app-details">
       <h2>
-      %if app.about_url:
-        <a href="${app.about_url}">${app.name}</a>
+      %if app_data['client'].about_url:
+        <a href="${app_data['client'].about_url}">${app_data['client'].name}</a>
       %else:
-        ${app.name}
+        ${app_data['client'].name}
       %endif
       </h2>
-      ${scope_details(scope, compact=True, expiration=expiration)}
+      ## `sorted` should put global permissions first (keyed off `None`)
+      %for sr in sorted(app_data['scopes']):
+        ${scope_details(app_data['scopes'][sr], compact=True)}<br>
+      %endfor
     </div>
-    <div class="app-description">${app.description}</div>
-    ${developers(app)}
+    <div class="app-description">${app_data['client'].description}</div>
+    ${developers(app_data['client'])}
     ${ynbutton(_("revoke access"),
                _("revoked"),
                "revokeapp",
                callback="r.apps.revoked",
-               hidden_data=dict(client_id=app._id),
+               hidden_data=dict(client_id=app_data['client']._id),
                _class="revoke-app-button")}
   </div>
 </%def>
@@ -268,8 +270,8 @@
 %if thing.my_apps:
   <h1>${_("authorized applications")}</h1>
 
-  %for app, scope, expiration in thing.my_apps:
-    ${authorized_app(app, scope, expiration)}
+  %for app_data in thing.my_apps.values():
+    ${authorized_app(app_data)}
   %endfor
 %endif
 

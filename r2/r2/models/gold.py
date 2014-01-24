@@ -24,9 +24,11 @@ from r2.lib.db.tdb_sql import make_metadata, index_str, create_table
 
 import pytz
 
+from pycassa import NotFoundException
+from pycassa.system_manager import INT_TYPE, UTF8_TYPE
 from pylons import g, c
 from pylons.i18n import _
-from datetime import datetime, timedelta
+from datetime import datetime
 import sqlalchemy as sa
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.ext.declarative import declarative_base
@@ -39,6 +41,7 @@ import re
 from random import choice
 from time import time
 
+from r2.lib.db import tdb_cassandra
 from r2.lib.db.tdb_cassandra import NotFound
 from r2.models import Account
 from r2.models.subreddit import Frontpage
@@ -78,10 +81,50 @@ gold_table = sa.Table('reddit_gold', METADATA,
 indices = [index_str(gold_table, 'status', 'status'),
            index_str(gold_table, 'date', 'date'),
            index_str(gold_table, 'account_id', 'account_id'),
-           index_str(gold_table, 'secret', 'secret', unique = True),
+           index_str(gold_table, 'secret', 'secret'),
            index_str(gold_table, 'payer_email', 'payer_email'),
            index_str(gold_table, 'subscr_id', 'subscr_id')]
 create_table(gold_table, indices)
+
+
+class GoldRevenueGoalByDate(object):
+    __metaclass__ = tdb_cassandra.ThingMeta
+
+    _use_db = True
+    _cf_name = "GoldRevenueGoalByDate"
+    _read_consistency_level = tdb_cassandra.CL.ONE
+    _write_consistency_level = tdb_cassandra.CL.ALL
+    _extra_schema_creation_args = {
+        "column_name_class": UTF8_TYPE,
+        "default_validation_class": INT_TYPE,
+    }
+    _compare_with = UTF8_TYPE
+    _type_prefix = None
+
+    ROWKEY = '1'
+
+    @staticmethod
+    def _colkey(date):
+        return date.strftime("%Y-%m-%d")
+
+    @classmethod
+    def set(cls, date, goal):
+        cls._cf.insert(cls.ROWKEY, {cls._colkey(date): int(goal)})
+
+    @classmethod
+    def get(cls, date):
+        """Gets the goal for a date, or the nearest previous goal."""
+        try:
+            colkey = cls._colkey(date)
+            col = cls._cf.get(
+                cls.ROWKEY,
+                column_reversed=True,
+                column_start=colkey,
+                column_count=1,
+            )
+            return col.values()[0]
+        except NotFoundException:
+            return None
 
 
 def create_unclaimed_gold (trans_id, payer_email, paying_id,
@@ -279,40 +322,24 @@ def gold_revenue_multi(dates):
                 for truncated_time, pennies in ENGINE.execute(query)}
 
 
-@memoize("gold-revenue", time=600)
-def gold_revenue_on(date):
+@memoize("gold-revenue-volatile", time=600)
+def gold_revenue_volatile(date):
+    return gold_revenue_multi([date]).get(date, 0)
+
+
+@memoize("gold-revenue-steady")
+def gold_revenue_steady(date):
     return gold_revenue_multi([date]).get(date, 0)
 
 
 @memoize("gold-goal")
 def gold_goal_on(date):
     """Returns the gold revenue goal (in pennies) for a given date."""
-    # handle the old static goal
-    if date <= gold_static_goal_cutoff.date():
-        return g.live_config["gold_revenue_goal"]
-
-    # fetch the revenues from the previous 7 days
-    previous_date = date - timedelta(days=1)
-    previous_revenues = []
-    while previous_date >= date - timedelta(days=7):
-        previous_revenues.append(gold_revenue_on(previous_date))
-        previous_date -= timedelta(days=1)
-
-    # throw out highest and lowest values and set goal to 110% of average
-    previous_revenues = sorted(previous_revenues)[1:-1]
-    average_revenue = sum(previous_revenues) / float(len(previous_revenues))
-    goal = average_revenue * 1.1
-
-    # don't let this be more than 20% different from the previous goal
-    previous_goal = gold_goal_on(date - timedelta(days=1))
-    goal = min(previous_goal * 1.2, goal)
-    goal = max(previous_goal * 0.8, goal)
-
-    return round(goal, 0)
+    return GoldRevenueGoalByDate.get(date)
 
 
 def account_from_stripe_customer_id(stripe_customer_id):
-    q = Account._query(Account.c.stripe_customer_id == stripe_customer_id,
+    q = Account._query(Account.c.gold_subscr_id == stripe_customer_id,
                        Account.c._spam == (True, False), data=True)
     return next(iter(q), None)
 
@@ -339,7 +366,7 @@ def _get_subscription_details(stripe_customer_id):
 
 
 def get_subscription_details(user):
-    if not getattr(user, 'stripe_customer_id', None):
+    if not getattr(user, 'gold_subscr_id', None):
         return
 
-    return _get_subscription_details(user.stripe_customer_id)
+    return _get_subscription_details(user.gold_subscr_id)

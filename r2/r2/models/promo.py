@@ -20,10 +20,8 @@
 # Inc. All Rights Reserved.
 ###############################################################################
 
-from collections import namedtuple
 from datetime import datetime, timedelta
 from uuid import uuid1
-import json
 
 from pycassa.types import CompositeType
 from pylons import g, c
@@ -96,6 +94,53 @@ HIGH, MEDIUM, REMNANT, HOUSE = HighPriority(), MediumPriority(), RemnantPriority
 PROMOTE_PRIORITIES = {p.name: p for p in (HIGH, MEDIUM, REMNANT, HOUSE)}
 PROMOTE_DEFAULT_PRIORITY = MEDIUM
 
+
+class Location(object):
+    DELIMITER = '-'
+    def __init__(self, country, region=None, metro=None):
+        self.country = country or None
+        self.region = region or None
+        self.metro = metro or None
+
+    def __repr__(self):
+        return '<%s (%s/%s/%s)>' % (self.__class__.__name__, self.country,
+                                    self.region, self.metro)
+
+    def to_code(self):
+        fields = [self.country, self.region, self.metro]
+        return self.DELIMITER.join(i or '' for i in fields)
+
+    @classmethod
+    def from_code(cls, code):
+        country, region, metro = [i or None for i in code.split(cls.DELIMITER)]
+        return cls(country, region, metro)
+
+    def contains(self, other):
+        if not self.country:
+            # self is set of all countries, it includes all possible
+            # values of other.country
+            return True
+        elif not other or not other.country:
+            # self is more specific than other
+            return False
+        else:
+            # both self and other specify a country
+            if self.country != other.country:
+                # countries don't match
+                return False
+            else:
+                # countries match
+                if not self.metro:
+                    # self.metro is set of all metros within country, it
+                    # includes all possible values of other.metro
+                    return True
+                elif not other.metro:
+                    # self is more specific than other
+                    return False
+                else:
+                    return self.metro == other.metro
+
+
 @memoize("get_promote_srid")
 def get_promote_srid(name = 'promos'):
     try:
@@ -121,6 +166,8 @@ NO_TRANSACTION = 0
 class PromoCampaign(Thing):
     _defaults = dict(
         priority_name=PROMOTE_DEFAULT_PRIORITY.name,
+        trans_id=NO_TRANSACTION,
+        location_code=None,
     )
 
     def __getattr__(self, attr):
@@ -138,7 +185,9 @@ class PromoCampaign(Thing):
         return priority.name
 
     @classmethod 
-    def _new(cls, link, sr_name, bid, cpm, start_date, end_date, priority):
+    def _new(cls, link, sr_name, bid, cpm, start_date, end_date, priority,
+             location):
+        location_code = location.to_code() if location else None
         pc = PromoCampaign(link_id=link._id,
                            sr_name=sr_name,
                            bid=bid,
@@ -147,7 +196,8 @@ class PromoCampaign(Thing):
                            end_date=end_date,
                            trans_id=NO_TRANSACTION,
                            owner_id=link.author_id,
-                           priority_name=cls.get_priority_name(priority))
+                           priority_name=cls.get_priority_name(priority),
+                           location_code=location_code)
         pc._commit()
         return pc
 
@@ -185,6 +235,13 @@ class PromoCampaign(Thing):
     def priority(self):
         return PROMOTE_PRIORITIES[self.priority_name]
 
+    @property
+    def location(self):
+        if self.location_code is not None:
+            return Location.from_code(self.location_code)
+        else:
+            return None
+
     def is_freebie(self):
         return self.trans_id < 0
 
@@ -193,7 +250,7 @@ class PromoCampaign(Thing):
         return self.start_date < now and self.end_date > now
 
     def update(self, start_date, end_date, bid, cpm, sr_name, trans_id,
-               priority, commit=True):
+               priority, location, commit=True):
         self.start_date = start_date
         self.end_date = end_date
         self.bid = bid
@@ -201,6 +258,7 @@ class PromoCampaign(Thing):
         self.sr_name = sr_name
         self.trans_id = trans_id
         self.priority_name = self.get_priority_name(priority)
+        self.location_code = location.to_code() if location else None
         if commit:
             self._commit()
 
@@ -236,111 +294,6 @@ class PromotionLog(tdb_cassandra.View):
             return []
         tuples = sorted(row._values().items(), key=lambda t: t[0].time)
         return [t[1] for t in tuples]
-
-
-AdWeight = namedtuple('AdWeight', 'link weight campaign')
-
-
-class LiveAdWeights(object):
-    """Data store for per-subreddit lists of currently running ads"""
-    __metaclass__ = tdb_cassandra.ThingMeta
-    _use_db = True
-    _connection_pool = 'main'
-    _type_prefix = None
-    _cf_name = None
-    _compare_with = tdb_cassandra.ASCII_TYPE
-    # TTL is 12 hours, to avoid unexpected ads running indefinitely
-    # See note in set_all_from_weights() for more information
-    _ttl = timedelta(hours=12)
-
-    column = 'adweights'
-    cache = g.cache
-    cache_prefix = 'live-adweights-'
-
-    ALL_ADS = 'all'
-    FRONT_PAGE = 'frontpage'
-
-    def __init__(self):
-        raise NotImplementedError()
-
-    @classmethod
-    def to_columns(cls, weights):
-        """Generate a serializable dict representation weights"""
-        return {cls.column: json.dumps(weights)}
-
-    @classmethod
-    def from_columns(cls, columns):
-        """Given a (serializable) dict, restore the weights"""
-        weights = json.loads(columns.get(cls.column, '[]')) if columns else []
-        # JSON doesn't have the concept of tuples; this restores the return
-        # value to being a list of tuples.
-        return [AdWeight(*w) for w in weights]
-
-    @classmethod
-    def _load_multi(cls, sr_ids):
-        skeys = {sr_id: str(sr_id) for sr_id in sr_ids}
-        adweights = cls._cf.multiget(skeys.values(), columns=[cls.column])
-        res = {}
-        for sr_id in sr_ids:
-            # The returned dictionary should include all sr_ids, so
-            # that ad-less SRs are inserted into the cache
-            res[skeys[sr_id]] = adweights.get(sr_id, {})
-        return res
-
-    @classmethod
-    def get(cls, sr_ids):
-        """Return a dictionary of sr_id -> list of ads for each of sr_ids"""
-        # Mangling: Caller convention is to use empty string for FRONT_PAGE
-        sr_ids = [(sr_id or cls.FRONT_PAGE) for sr_id in sr_ids]
-        adweights = sgm(cls.cache, sr_ids, cls._load_multi,
-                        prefix=cls.cache_prefix, stale=True)
-        results = {sr_id: cls.from_columns(adweights[sr_id])
-                   for sr_id in adweights}
-        if cls.FRONT_PAGE in results:
-            results[''] = results.pop(cls.FRONT_PAGE)
-        return results
-
-    @classmethod
-    def get_live_subreddits(cls):
-        q = cls._cf.get_range()
-        results = []
-        empty = {cls.column: '[]'}
-        for sr_id, columns in q:
-            if sr_id in (cls.ALL_ADS, cls.FRONT_PAGE):
-                continue
-            if not columns or columns == empty:
-                continue
-            results.append(int(sr_id))
-        return results
-
-    @classmethod
-    def set_all_from_weights(cls, all_weights):
-        """Given a dictionary with all ads that should currently be running
-        (where the dictionary keys are the subreddit IDs, and the paired
-        value is the list of ads for that subreddit), update the ad system
-        to use those ads on those subreddits.
-
-        Note: Old ads are not cleared out. It is expected that the caller
-        include empty-list entries in `all_weights` for any Subreddits
-        that should be cleared.
-
-        """
-        weights = {}
-        all_ads = []
-        for sr_id, sr_ads in all_weights.iteritems():
-            all_ads.extend(sr_ads)
-            weights[str(sr_id)] = cls.to_columns(sr_ads)
-        weights[cls.ALL_ADS] = cls.to_columns(all_ads)
-
-        cls._cf.batch_insert(weights, ttl=cls._ttl)
-
-        # Prep the cache!
-        cls.cache.set_multi(weights, prefix=cls.cache_prefix)
-
-    @classmethod
-    def clear(cls, sr_id):
-        """Clear ad information from the Subreddit with ID `sr_id`"""
-        cls.set_all_from_weights({sr_id: []})
 
 
 class PromotedLinkRoadblock(tdb_cassandra.View):

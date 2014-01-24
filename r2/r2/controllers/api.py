@@ -43,7 +43,7 @@ from r2.lib import hooks
 
 from r2.lib.utils import get_title, sanitize_url, timeuntil, set_last_modified
 from r2.lib.utils import query_string, timefromnow, randstr
-from r2.lib.utils import timeago, tup, filter_links
+from r2.lib.utils import timeago, tup
 from r2.lib.pages import (EnemyList, FriendList, ContributorList, ModList,
                           BannedList, WikiBannedList, WikiMayContributeList,
                           BoringPage, FormPage, CssError, UploadedImage,
@@ -51,7 +51,11 @@ from r2.lib.pages import (EnemyList, FriendList, ContributorList, ModList,
 from r2.lib.pages import FlairList, FlairCsv, FlairTemplateEditor, \
     FlairSelector
 from r2.lib.pages import PrefApps
-from r2.lib.pages.things import wrap_links, default_thing_wrapper
+from r2.lib.pages.things import (
+    default_thing_wrapper,
+    hot_links_by_url_listing,
+    wrap_links,
+)
 from r2.models.last_modified import LastModified
 
 from r2.lib.menus import CommentSortMenu
@@ -78,6 +82,7 @@ from r2.controllers.ipn import generate_blob
 from r2.lib.lock import TimeoutExpired
 
 from r2.models import wiki
+from r2.models.recommend import AccountSRFeedback
 from r2.lib.merge import ConflictException
 
 import csv
@@ -141,11 +146,11 @@ class ApiController(RedditController, OAuth2ResourceController):
 
     @pagecache_policy(PAGECACHE_POLICY.NEVER)
     @require_oauth2_scope("read")
-    @validate(link1 = VUrl(['url']),
-              link2 = VByName('id'),
+    @validate(url=VUrl('url'),
+              link=VByName('id'),
               count = VLimit('limit'))
-    @api_doc(api_section.links_and_comments)
-    def GET_info(self, link1, link2, count):
+    @api_doc(api_section.links_and_comments, uses_site=True)
+    def GET_info(self, url, link, count):
         """Get a link by fullname or a list of links by URL.
 
         If `id` is provided, the link with the given fullname will be returned.
@@ -154,18 +159,18 @@ class ApiController(RedditController, OAuth2ResourceController):
 
         If both `url` and `id` are provided, `id` will take precedence.
 
+        If a subreddit is provided, only links in that subreddit will be
+        returned.
+
         """
 
         c.update_last_visit = False
 
-        links = []
-        if link2:
-            links = filter_links(tup(link2), filter_spam = False)
-        elif link1 and ('ALREADY_SUB', 'url')  in c.errors:
-            links = filter_links(tup(link1), filter_spam = False)
-
-        listing = wrap_links(filter(None, links or []), num = count)
-        return BoringPage(_("API"), content = listing).render()
+        if link or not url:
+            listing = wrap_links(link or [], num=count)
+        else:
+            listing = hot_links_by_url_listing(url, sr=c.site, num=count)
+        return BoringPage(_("API"), content=listing).render()
 
 
     @json_validate()
@@ -251,8 +256,16 @@ class ApiController(RedditController, OAuth2ResourceController):
             queries.new_message(m, inbox_rel)
 
     @json_validate()
-    @api_doc(api_section.subreddits)
+    @api_doc(api_section.subreddits, uses_site=True, extensions=["json"])
     def GET_submit_text(self, responder):
+        """Get the submission text for the subreddit.
+
+        This text is set by the subreddit moderators and intended to be
+        displayed on the submission form.
+
+        See also: [/api/site_admin](#POST_api_site_admin).
+
+        """
         if c.site.over_18 and not c.over18:
             submit_text = None
             submit_text_html = None
@@ -271,7 +284,7 @@ class ApiController(RedditController, OAuth2ResourceController):
                    VShamedDomain('url'),
                    ip = ValidIP(),
                    sr = VSubmitSR('sr', 'kind'),
-                   url = VUrl(['url', 'sr', 'resubmit']),
+                   url = VUrl('url'),
                    title = VTitle('title'),
                    save = VBoolean('save'),
                    sendreplies = VBoolean('sendreplies'),
@@ -281,10 +294,11 @@ class ApiController(RedditController, OAuth2ResourceController):
                                  default='comments'),
                    extension=VLength("extension", 20, docs={"extension":
                        "extension used for redirects"}),
+                   resubmit=VBoolean('resubmit'),
                   )
     @api_doc(api_section.links_and_comments)
     def POST_submit(self, form, jquery, url, selftext, kind, title,
-                    save, sr, ip, then, extension, sendreplies):
+                    save, sr, ip, then, extension, sendreplies, resubmit):
         """Submit a link to a subreddit.
 
         Submit will create a link or self-post in the subreddit `sr` with the
@@ -305,8 +319,7 @@ class ApiController(RedditController, OAuth2ResourceController):
 
         from r2.models.admintools import is_banned_domain
 
-        if isinstance(url, (unicode, str)):
-            #backwards compatability
+        if url:
             if url.lower() == 'self':
                 url = kind = 'self'
 
@@ -358,14 +371,19 @@ class ApiController(RedditController, OAuth2ResourceController):
                 pass
             elif form.has_errors("url", errors.DOMAIN_BANNED):
                 g.stats.simple_event('spam.shame.link')
-            elif form.has_errors("url", errors.ALREADY_SUB):
-                check_domain = False
-                u = url[0].already_submitted_link
-                if extension:
-                    u = UrlParser(u)
-                    u.set_extension(extension)
-                    u = u.unparse()
-                form.redirect(u)
+            elif not resubmit:
+                listing = hot_links_by_url_listing(url, sr=sr, num=1)
+                links = listing.things
+                if links:
+                    c.errors.add(errors.ALREADY_SUB, field='url')
+                    form.has_errors('url', errors.ALREADY_SUB)
+                    check_domain = False
+                    u = links[0].already_submitted_link
+                    if extension:
+                        u = UrlParser(u)
+                        u.set_extension(extension)
+                        u = u.unparse()
+                    form.redirect(u)
             # check for title, otherwise look it up and return it
             elif form.has_errors("title", errors.NO_TEXT):
                 pass
@@ -568,6 +586,10 @@ class ApiController(RedditController, OAuth2ResourceController):
             user._commit()
 
             amqp.add_item('new_account', user._fullname)
+
+            reject = hooks.get_hook("account.spotcheck").call(account=user)
+            if any(reject):
+                return
 
             c.user = user
             self._login(responder, user, rem)
@@ -866,6 +888,7 @@ class ApiController(RedditController, OAuth2ResourceController):
             notify_user_added(type, c.user, friend, container)
 
     @validatedForm(VGold(),
+                   VModhash(),
                    friend = VExistingUname('name'),
                    note = VLength('note', 300))
     def POST_friendnote(self, form, jquery, friend, note):
@@ -874,10 +897,18 @@ class ApiController(RedditController, OAuth2ResourceController):
         c.user.add_friend_note(friend, note)
         form.set_html('.status', _("saved"))
 
-    @validatedForm(type = VOneOf('type', ('bannednote', 'wikibannednote')),
+    @validatedForm(VModhash(),
+                   type = VOneOf('type', ('bannednote', 'wikibannednote')),
                    user = VExistingUname('name'),
                    note = VLength('note', 300))
     def POST_relnote(self, form, jquery, type, user, note):
+        perm = 'wiki' if type.startswith('wiki') else 'access'
+        if (not c.user_is_admin
+            and (not c.site.is_moderator_with_perms(c.user, perm))):
+            if c.user._spam:
+                return
+            else:
+                abort(403, 'forbidden')
         if form.has_errors("note", errors.TOO_LONG):
             return
         c.site.add_rel_note(type[:-4], user, note)
@@ -893,7 +924,8 @@ class ApiController(RedditController, OAuth2ResourceController):
         The authenticated user must have been invited to moderate the subreddit
         by one of its current moderators.
 
-        See also: [/api/friend](#POST_api_friend).
+        See also: [/api/friend](#POST_api_friend) and
+        [/subreddits/mine](#GET_subreddits_mine_{where}).
 
         """
 
@@ -1129,6 +1161,15 @@ class ApiController(RedditController, OAuth2ResourceController):
         See also: [/api/marknsfw](#POST_api_marknsfw).
 
         """
+
+        if promote.is_promo(thing):
+            if c.user_is_sponsor:
+                # set the override attribute so this link won't be automatically
+                # reset as nsfw by promote.make_daily_promotions
+                thing.over_18_override = True
+            else:
+                abort(403,'forbidden')
+
         thing.over_18 = False
         thing._commit()
 
@@ -1138,6 +1179,17 @@ class ApiController(RedditController, OAuth2ResourceController):
 
         # flag search indexer that something has changed
         changed(thing)
+
+    @noresponse(VUser(),
+                VModhash(),
+                VSrCanAlter('id'),
+                thing=VByName('id'))
+    def POST_rescrape(self, thing):
+        """Re-queues the link in the media scraper."""
+        if not isinstance(thing, Link):
+            return
+
+        amqp.add_item("scraper_q", thing._fullname)
 
     @require_oauth2_scope("modposts")
     @validatedForm(VUser(),
@@ -1232,14 +1284,19 @@ class ApiController(RedditController, OAuth2ResourceController):
         if not thing:
             return
 
+        try:
+            sr = Subreddit._byID(thing.sr_id) if thing.sr_id else None
+        except NotFound:
+            sr = None
         # Users may only block someone who has
         # actively harassed them (i.e., comment/link reply
         # or PM). Check that 'thing' is in the user's inbox somewhere
-        inbox_cls = Inbox.rel(Account, thing.__class__)
-        rels = inbox_cls._fast_query(c.user, thing,
-                                     ("inbox", "selfreply", "mention"))
-        if not filter(None, rels.values()):
-            return
+        if not (sr and sr.is_moderator_with_perms(c.user, 'mail')):
+            inbox_cls = Inbox.rel(Account, thing.__class__)
+            rels = inbox_cls._fast_query(c.user, thing,
+                                        ("inbox", "selfreply", "mention"))
+            if not filter(None, rels.values()):
+                return
 
         block_acct = Account._byID(thing.author_id)
         if block_acct.name in g.admins:
@@ -1568,12 +1625,26 @@ class ApiController(RedditController, OAuth2ResourceController):
     @validatedForm(VUser(),
                    VModhash(),
                    # nop is safe: handled after auth checks below
-                   stylesheet_contents = nop('stylesheet_contents'),
-                   prevstyle = VLength('prevstyle', max_length=36),
+                   stylesheet_contents=nop('stylesheet_contents',
+                       docs={"stylesheet_contents":
+                             "the new stylesheet content"}),
+                   prevstyle=VLength('prevstyle', max_length=36,
+                                     docs={"prevstyle":
+                                           "(optional) a revision ID"}),
                    op = VOneOf('op',['save','preview']))
     @api_doc(api_section.subreddits, uses_site=True)
     def POST_subreddit_stylesheet(self, form, jquery,
                                   stylesheet_contents = '', prevstyle='', op='save'):
+        """Update a subreddit's stylesheet.
+
+        `op` should be `save` to update the contents of the stylesheet.
+
+        If `prevstyle` is specified, it should be the revision ID the submitted
+        version is a modification of. Wiki-style edit conflict resolution will
+        be done when this is specified, otherwise the content will be blindly
+        overwritten.
+
+        """
         
         if form.has_errors("prevstyle", errors.TOO_LONG):
             return
@@ -1671,10 +1742,16 @@ class ApiController(RedditController, OAuth2ResourceController):
                    name = VCssName('img_name'))
     @api_doc(api_section.subreddits, uses_site=True)
     def POST_delete_sr_img(self, form, jquery, name):
-        """
-        Called upon requested delete on /about/stylesheet.
-        Updates the site's image list, and causes the <li> which wraps
-        the image to be hidden.
+        """Remove an image from the subreddit's custom image set.
+
+        The image will no longer count against the subreddit's image limit.
+        However, the actual image data may still be accessible for an
+        unspecified amount of time. If the image is currently referenced by the
+        subreddit's stylesheet, that stylesheet will no longer validate and
+        won't be editable until the image reference is removed.
+
+        See also: [/api/upload_sr_img](#POST_api_upload_sr_img).
+
         """
         # just in case we need to kill this feature from XSS
         if g.css_killswitch:
@@ -1692,8 +1769,12 @@ class ApiController(RedditController, OAuth2ResourceController):
                    VModhash())
     @api_doc(api_section.subreddits, uses_site=True)
     def POST_delete_sr_header(self, form, jquery):
-        """
-        Called when the user request that the header on a sr be reset.
+        """Remove the subreddit's custom header image.
+
+        The sitewide-default header image will be shown again after this call.
+
+        See also: [/api/upload_sr_img](#POST_api_upload_sr_img).
+
         """
         # just in case we need to kill this feature from XSS
         if g.css_killswitch:
@@ -1730,24 +1811,32 @@ class ApiController(RedditController, OAuth2ResourceController):
               file = VUploadLength('file', max_length=1024*500),
               name = VCssName("name"),
               img_type = VImageType('img_type'),
-              form_id = VLength('formid', max_length = 100), 
+              form_id = VLength('formid', max_length = 100,
+                                docs={"formid": "(optional) can be ignored"}),
               header = VInt('header', max=1, min=0))
     @api_doc(api_section.subreddits, uses_site=True)
     def POST_upload_sr_img(self, file, header, name, form_id, img_type):
-        """
-        Called on /about/stylesheet when an image needs to be replaced
-        or uploaded, as well as on /about/edit for updating the
-        header.  Unlike every other POST in this controller, this
-        method does not get called with Ajax but rather is from the
-        original form POSTing to a hidden iFrame.  Unfortunately, this
-        means the response needs to generate an page with a script tag
-        to fire the requisite updates to the parent document, and,
-        more importantly, that we can't use our normal toolkit for
-        passing those responses back.
+        """Add or replace a subreddit image or custom header logo.
 
-        The result of this function is a rendered UploadedImage()
-        object in charge of firing the completedUploadImage() call in
-        JS.
+        If the `header` value is `0`, an image for use in the subreddit
+        stylesheet is uploaded with the name specified in `name`. If the value
+        of `header` is `1` then the image uploaded will be the subreddit's new
+        logo and `name` will be ignored.
+
+        The `img_type` field specifies whether to store the uploaded image as a
+        PNG or JPEG.
+
+        Subreddits have a limited number of images that can be in use at any
+        given time. If no image with the specified name already exists, one of
+        the slots will be consumed.
+
+        If an image with the specified name already exists, it will be
+        replaced.  This does not affect the stylesheet immediately, but will
+        take effect the next time the stylesheet is saved.
+
+        See also: [/api/delete_sr_img](#POST_api_delete_sr_img) and
+        [/api/delete_sr_header](#POST_api_delete_sr_header).
+
         """
 
         # default error list (default values will reset the errors in
@@ -1836,6 +1925,31 @@ class ApiController(RedditController, OAuth2ResourceController):
                    )
     @api_doc(api_section.subreddits)
     def POST_site_admin(self, form, jquery, name, ip, sr, **kw):
+        """Create or configure a subreddit.
+
+        If `sr` is specified, the request will attempt to modify the specified
+        subreddit. If not, a subreddit with name `name` will be created.
+
+        This endpoint expects *all* values to be supplied on every request.  If
+        modifying a subset of options, it may be useful to get the current
+        settings from [/about/edit.json](#GET_r_{subreddit}_about_edit.json)
+        first.
+
+        The fields `prev_public_description_id`, `prev_description_id` and
+        `prev_submit_text_id` are optional. If specified, they should be the
+        wiki revision IDs of the last-seen versions of these pieces of text to
+        allow for wiki-style edit conflict resolution.
+
+        For backwards compatibility, `description` is the sidebar text and
+        `public_description` is the publicly visible subreddit description.
+
+        Most of the parameters for this endpoint are identical to options
+        visible in the user interface and their meanings are best explained
+        there.
+
+        See also: [/about/edit.json](#GET_r_{subreddit}_about_edit.json).
+
+        """
         def apply_wikid_field(sr, form, pagename, value, prev, field, error):
             id_field_name = 'prev_%s_id' % field
             try:
@@ -2082,6 +2196,16 @@ class ApiController(RedditController, OAuth2ResourceController):
                         moderator_banned=not c.user_is_admin,
                         banner=c.user.name,
                         train_spam=train_spam)
+
+        modified_thing = None
+        if isinstance(thing, Link):
+            modified_thing = thing
+        elif isinstance(thing, Comment):
+            modified_thing = Link._byID(thing.link_id)
+
+        if modified_thing:
+            set_last_modified(modified_thing, 'comments')
+            LastModified.touch(modified_thing._fullname, 'Comments')
 
         if isinstance(thing, (Link, Comment)):
             sr = thing.subreddit_slow
@@ -2503,8 +2627,8 @@ class ApiController(RedditController, OAuth2ResourceController):
 
     @validate(uh = nop('uh'), # VModHash() will raise, check manually
               action = VOneOf('what', ('like', 'dislike', 'save')),
-              links = VUrl(['u']))
-    def GET_bookmarklet(self, action, uh, links):
+              url=VUrl('u'))
+    def GET_bookmarklet(self, action, uh, url):
         '''Controller for the functionality of the bookmarklets (not
         the distribution page)'''
 
@@ -2517,14 +2641,18 @@ class ApiController(RedditController, OAuth2ResourceController):
         elif not c.user.valid_hash(uh) or not action:
             return self.redirect("/static/css_update.png")
         # unlike most cases, if not already submitted, error.
-        elif errors.ALREADY_SUB in c.errors:
-            # preserve the subreddit if not Default
+        elif url:
             sr = c.site if not isinstance(c.site, FakeSubreddit) else None
+            try:
+                links_for_url = Link._by_url(url, sr)
+            except NotFound:
+                links_for_url = []
 
             # check permissions on those links to make sure votes will count
-            Subreddit.load_subreddits(links, return_dict = False)
+            Subreddit.load_subreddits(links_for_url, return_dict = False)
             user = c.user if c.user_is_loggedin else None
-            links = [l for l in links if l.subreddit_slow.can_view(user)]
+            links = [link for link in links_for_url
+                          if link.subreddit_slow.can_view(user)]
 
             if links:
                 if action in ['like', 'dislike']:
@@ -2638,8 +2766,13 @@ class ApiController(RedditController, OAuth2ResourceController):
         g.log.warning("%s did a password reset for %s via %s",
                       request.ip, user.name, token._id)
 
-        self._login(jquery, user)
-        jquery.redirect('/')
+        # if the token is for the current user, their cookies will be
+        # invalidated and they'll have to log in again.
+        if not c.user_is_loggedin or c.user._fullname == token.user_id:
+            jquery.redirect('/login')
+
+        form.set_html(".status", _("password updated"))
+
 
 
     @noresponse(VUser())
@@ -2667,6 +2800,15 @@ class ApiController(RedditController, OAuth2ResourceController):
                 sr = VSubscribeSR('sr', 'sr_name'))
     @api_doc(api_section.subreddits)
     def POST_subscribe(self, action, sr):
+        """Subscribe to or unsubscribe from a subreddit.
+
+        To subscribe, `action` should be `sub`. To unsubscribe, `action` should
+        be `unsub`. The user must have access to the subreddit to be able to
+        subscribe to it.
+
+        See also: [/subreddits/mine/](#GET_subreddits_mine_{where}).
+
+        """
         # only users who can make edits are allowed to subscribe.
         # Anyone can leave.
         if sr and (action != 'sub' or sr.can_comment(c.user)):
@@ -3303,6 +3445,9 @@ class ApiController(RedditController, OAuth2ResourceController):
                    remember=VBoolean("remember"),
                    dest=VDestination())
     def POST_adminon(self, form, jquery, remember, dest):
+        if c.user.name not in g.admins:
+            self.abort403()
+
         if form.has_errors('password', errors.WRONG_PASSWORD):
             return
 
@@ -3369,6 +3514,7 @@ class ApiController(RedditController, OAuth2ResourceController):
     @json_validate(query=VLength("query", max_length=50))
     @api_doc(api_section.subreddits, extensions=["json"])
     def GET_subreddits_by_topic(self, responder, query):
+        """Return a list of subreddits that are relevant to a search query."""
         if not g.CLOUDSEARCH_SEARCH_API:
             return []
 
@@ -3569,19 +3715,13 @@ class ApiController(RedditController, OAuth2ResourceController):
             return
 
         srnames = srnames.split('+')
-        if Frontpage.name in srnames:
-            srids = ['']
+        try:
             srnames.remove(Frontpage.name)
-        else:
-            srids = []
+            srnames.append('')
+        except ValueError:
+            pass
 
-        srs = Subreddit._by_name(srnames).values()
-        srids.extend([sr._id for sr in srs])
-
-        if not srids:
-            return
-
-        promo_tuples = promote.lottery_promoted_links(srids, n=10)
+        promo_tuples = promote.lottery_promoted_links(srnames, n=10)
         builder = CampaignBuilder(promo_tuples,
                                   wrap=default_thing_wrapper(),
                                   keep_fn=promote.is_promoted,
@@ -3590,6 +3730,7 @@ class ApiController(RedditController, OAuth2ResourceController):
         listing = LinkListing(builder, nextprev=False).listing()
         if listing.things:
             w = listing.things[0]
+            w.num = ""
             return spaceCompress(w.render())
 
     @json_validate(
@@ -3603,7 +3744,7 @@ class ApiController(RedditController, OAuth2ResourceController):
 
     @validate(srs=VSRByNames("srnames"),
               to_omit=VSRByNames("omit", required=False))
-    @api_doc(api_section.subreddits)
+    @api_doc(api_section.subreddits, uri='/api/recommend/sr/{srnames}')
     def GET_subreddit_recommendations(self, srs, to_omit):
         """Return subreddits recommended for the given subreddit(s).
 
@@ -3611,10 +3752,21 @@ class ApiController(RedditController, OAuth2ResourceController):
         that appear in the optional `omit` param.
 
         """
+        omit_id36s = [sr._id36 for sr in to_omit.values()]
         rec_srs = recommender.get_recommendations(srs.values(),
-                                                  to_omit=to_omit.values())
+                                                  to_omit=omit_id36s)
         sr_data = [{'sr_name': sr.name} for sr in rec_srs]
         return json.dumps(sr_data)
+
+
+    @validatedForm(VUser(),
+                   VModhash(),
+                   action=VOneOf("type", recommend.FEEDBACK_ACTIONS),
+                   srs=VSRByNames("srnames"))
+    def POST_rec_feedback(self, form, jquery, action, srs):
+        if form.has_errors("type", errors.INVALID_OPTION):
+            return self.abort404()
+        AccountSRFeedback.record_feedback(c.user, srs.values(), action)
 
 
     @validatedForm(

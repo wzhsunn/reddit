@@ -37,6 +37,7 @@ from r2.lib.jsonresponse import JQueryResponse, JsonResponse
 from r2.lib.log import log_text
 from r2.lib.permissions import ModeratorPermissionSet
 from r2.models import *
+from r2.models.promo import Location
 from r2.lib.authorize import Address, CreditCard
 from r2.lib.utils import constant_time_compare
 from r2.lib.require import require, require_split, RequirementException
@@ -365,6 +366,11 @@ class VLang(Validator):
     def run(self, lang):
         return VLang.validate_lang(lang)
 
+    def param_docs(self):
+        return {
+            self.param: "a valid IETF language tag (underscore separated)",
+        }
+
 class VRequired(Validator):
     def __init__(self, param, error, *a, **kw):
         Validator.__init__(self, param, *a, **kw)
@@ -478,6 +484,11 @@ class VCount(Validator):
         except ValueError:
             return 0
 
+    def param_docs(self):
+        return {
+            self.param: "a positive integer (default: 0)",
+        }
+
 
 class VLimit(Validator):
     def __init__(self, param, default=25, max_limit=100, **kw):
@@ -554,6 +565,12 @@ class VLength(Validator):
         else:
             return text
 
+    def param_docs(self):
+        return {
+            self.param:
+                "a string no longer than %d characters" % self.max_length,
+        }
+
 class VUploadLength(VLength):
     def run(self, upload, text2=''):
         # upload is expected to be a FieldStorage object
@@ -561,6 +578,13 @@ class VUploadLength(VLength):
             return VLength.run(self, upload.value, text2)
         else:
             self.set_error(self.empty_error, code=400)
+
+    def param_docs(self):
+        kibibytes = self.max_length / 1024
+        return {
+            self.param:
+                "file upload with maximum size of %d KiB" % kibibytes,
+        }
 
 class VPrintable(VLength):
     def run(self, text, text2 = ''):
@@ -695,9 +719,7 @@ class VSRByNames(Validator):
             return Subreddit._by_name(sr_names)
         elif self.required:
             self.set_error(errors.BAD_SR_NAME, code=400)
-            return
-        else:
-            return {}
+        return {}
 
     def param_docs(self):
         return {
@@ -879,7 +901,8 @@ def make_or_admin_secret_cls(base_cls):
         def run(self, secret=None):
             '''If validation succeeds, return True if the secret was used,
             False otherwise'''
-            if secret and constant_time_compare(secret, g.ADMINSECRET):
+            if secret and constant_time_compare(secret,
+                                                g.secrets["ADMINSECRET"]):
                 return True
             super(VOrAdminSecret, self).run()
             return False
@@ -1152,6 +1175,11 @@ class VSubscribeSR(VByName):
 
         return sr
 
+    def param_docs(self):
+        return {
+            self.param[0]: "name of a subreddit",
+        }
+
 MIN_PASSWORD_LENGTH = 3
 
 class VPassword(Validator):
@@ -1263,26 +1291,16 @@ class VSanitizedUrl(Validator):
     def param_docs(self):
         return {self.param: "a valid URL"}
 
+
 class VUrl(VRequired):
-    def __init__(self, item, allow_self = True, lookup = True, *a, **kw):
+    def __init__(self, item, allow_self=True, *a, **kw):
         self.allow_self = allow_self
-        self.lookup = lookup
         VRequired.__init__(self, item, errors.NO_URL, *a, **kw)
 
-    def run(self, url, sr = None, resubmit=False):
-        if sr is None and not isinstance(c.site, FakeSubreddit):
-            sr = c.site
-        elif sr:
-            try:
-                sr = Subreddit._by_name(str(sr))
-            except (NotFound, UnicodeEncodeError):
-                self.set_error(errors.SUBREDDIT_NOEXIST)
-                sr = None
-        else:
-            sr = None
-
+    def run(self, url):
         if not url:
             return self.error(errors.NO_URL)
+
         url = utils.sanitize_url(url)
         if not url:
             return self.error(errors.BAD_URL)
@@ -1290,30 +1308,14 @@ class VUrl(VRequired):
         if url == 'self':
             if self.allow_self:
                 return url
-        elif not self.lookup or resubmit:
+            else:
+                self.error(errors.BAD_URL)
+        else:
             return url
-        elif url:
-            try:
-                l = Link._by_url(url, sr)
-                self.error(errors.ALREADY_SUB)
-                return utils.tup(l)
-            except NotFound:
-                return url
-        return self.error(errors.BAD_URL)
 
     def param_docs(self):
-        if isinstance(self.param, (list, tuple)):
-            param_names = self.param
-        else:
-            param_names = [self.param]
-        params = {}
-        try:
-            params[param_names[0]] = 'a valid URL'
-            params[param_names[1]] = 'a subreddit'
-            params[param_names[2]] = 'boolean value'
-        except IndexError:
-            pass
-        return params
+        return {self.param: "a valid URL"}
+
 
 class VShamedDomain(Validator):
     def run(self, url):
@@ -1450,6 +1452,21 @@ class VInt(VNumber):
     def cast(self, val):
         return int(val)
 
+    def param_docs(self):
+        if self.min is not None and self.max is not None:
+            description = "an integer between %d and %d" % (self.min, self.max)
+        elif self.min is not None:
+            description = "an integer greater than %d" % self.min
+        elif self.max is not None:
+            description = "an integer less than %d" % self.max
+        else:
+            description = "an integer"
+
+        if self.num_default is not None:
+            description += " (default: %d)" % self.num_default
+
+        return {self.param: description}
+
 class VFloat(VNumber):
     def cast(self, val):
         return float(val)
@@ -1473,6 +1490,11 @@ class VCssName(Validator):
             else:
                 self.set_error(errors.BAD_CSS_NAME)
         return ''
+
+    def param_docs(self):
+        return {
+            self.param: "a valid subreddit image name",
+        }
 
 
 class VMenu(Validator):
@@ -1688,11 +1710,38 @@ class VPriority(Validator):
             return PROMOTE_DEFAULT_PRIORITY
 
 
+class VLocation(Validator):
+    default_param = ("country", "region", "metro")
+
+    def run(self, country, region, metro):
+        if not c.user_is_sponsor:
+            return None
+
+        if not (country or region or metro):
+            return None
+
+        if not (country and not (region or metro) or
+                (country and region and metro)):
+            # can target just country or country, region, and metro
+            self.set_error(errors.INVALID_LOCATION, code=400)
+        elif (country not in g.locations or
+              region and region not in g.locations[country]['regions'] or
+              metro and metro not in g.locations[country]['regions'][region]['metros']):
+            self.set_error(errors.INVALID_LOCATION, code=400)
+        else:
+            return Location(country, region, metro)
+
+
 class VImageType(Validator):
     def run(self, img_type):
         if not img_type in ('png', 'jpg'):
             return 'png'
         return img_type
+
+    def param_docs(self):
+        return {
+            self.param: "one of `png` or `jpg` (default: `png`)",
+        }
 
 
 class ValidEmails(Validator):
@@ -1815,6 +1864,10 @@ class VCnameDomain(Validator):
                 return str(domain).lower()
             except UnicodeEncodeError:
                 self.set_error(errors.BAD_CNAME)
+
+    def param_docs(self):
+        # cnames are dead; don't advertise this.
+        return {}
 
 
 # NOTE: make sure *never* to have res check these are present
@@ -2044,6 +2097,10 @@ class VTarget(Validator):
     def run(self, name):
         if name and self.target_re.match(name):
             return name
+
+    def param_docs(self):
+        # this is just for htmllite and of no interest to api consumers
+        return {}
 
 class VFlairAccount(VRequired):
     def __init__(self, item, *a, **kw):

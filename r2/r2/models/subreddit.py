@@ -40,7 +40,7 @@ from r2.lib.db.operators import lower, or_, and_, desc
 from r2.lib.errors import UserRequiredException
 from r2.lib.memoize import memoize
 from r2.lib.permissions import ModeratorPermissionSet
-from r2.lib.utils import tup, interleave_lists, last_modified_multi, flatten
+from r2.lib.utils import tup, last_modified_multi, fuzz_activity
 from r2.lib.utils import timeago, summarize_markdown
 from r2.lib.cache import sgm
 from r2.lib.strings import strings, Score
@@ -53,8 +53,6 @@ from r2.lib.contrib.rcssmin import cssmin
 from r2.lib import hooks
 from r2.models.query_cache import MergedCachedQuery
 import pycassa
-
-import math
 
 from r2.lib.utils import set_last_modified
 from r2.models.wiki import WikiPage
@@ -329,6 +327,22 @@ class Subreddit(Thing, Printable, BaseSite):
         else:
             return None
 
+    def add_moderator(self, user, **kwargs):
+        if not user.modmsgtime:
+            user.modmsgtime = False
+            user._commit()
+        return super(Subreddit, self).add_moderator(user, **kwargs)
+
+    def remove_moderator(self, user, **kwargs):
+        ret = super(Subreddit, self).remove_moderator(user, **kwargs)
+
+        is_mod_somewhere = bool(Subreddit.reverse_moderator_ids(user))
+        if not is_mod_somewhere:
+            user.modmsgtime = None
+            user._commit()
+
+        return ret
+
     @property
     def moderators(self):
         return self.moderator_ids()
@@ -403,10 +417,7 @@ class Subreddit(Thing, Printable, BaseSite):
             fuzzed = True
             cached_count = g.cache.get(key)
             if not cached_count:
-                # decay constant is e**(-x / 60)
-                decay = math.exp(float(-count) / 60)
-                jitter = round(5 * decay)
-                count = count + random.randint(0, jitter)
+                count = fuzz_activity(count)
                 g.cache.set(key, count, time=5*60)
             else:
                 count = cached_count
@@ -1533,6 +1544,32 @@ class ModSR(ModContribSR):
 
     def is_moderator(self, user):
         return FakeSRMember(ModeratorPermissionSet)
+
+
+class ModMinus(ModSR):
+    def __init__(self, exclude_srs):
+        ModSR.__init__(self)
+        self.exclude_srs = exclude_srs
+        self.exclude_sr_ids = [sr._id for sr in exclude_srs]
+
+    @property
+    def sr_ids(self):
+        sr_ids = super(ModMinus, self).sr_ids
+        return [sr_id for sr_id in sr_ids if not sr_id in self.exclude_sr_ids]
+
+    @property
+    def name(self):
+        exclude_text = ', '.join(sr.name for sr in self.exclude_srs)
+        return 'subreddits you moderate except ' + exclude_text
+
+    @property
+    def title(self):
+        return self.name
+
+    @property
+    def path(self):
+        return '/r/mod-' + '-'.join(sr.name for sr in self.exclude_srs)
+
 
 class ContribSR(ModContribSR):
     name  = "contrib"

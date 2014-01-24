@@ -348,10 +348,9 @@ class IdentityJsonTemplate(ThingJsonTemplate):
     )
 
     def thing_attr(self, thing, attr):
-        from r2.models import Subreddit
         if attr == "is_mod":
             t = thing.lookups[0] if isinstance(thing, Wrapped) else thing
-            return bool(Subreddit.reverse_moderator_ids(t))
+            return t.is_moderator_somewhere
         return ThingJsonTemplate.thing_attr(self, thing, attr)
 
 class AccountJsonTemplate(IdentityJsonTemplate):
@@ -486,6 +485,7 @@ class CommentJsonTemplate(ThingJsonTemplate):
         num_reports="num_reports",
         parent_id="parent_id",
         replies="child",
+        saved="saved",
         score_hidden="score_hidden",
         subreddit="subreddit",
         subreddit_id="subreddit_id",
@@ -522,6 +522,7 @@ class CommentJsonTemplate(ThingJsonTemplate):
         d = ThingJsonTemplate.raw_data(self, thing)
         if c.profilepage:
             d['link_title'] = thing.link.title
+            d['link_author'] = thing.link_author.name
         return d
 
     def rendered_data(self, wrapped):
@@ -777,6 +778,7 @@ class WikiSettingsJsonTemplate(ThingJsonTemplate):
      def data(self, thing):
          editors = [Wrapped(e).render() for e in thing.mayedit]
          return dict(permlevel=thing.permlevel,
+                     listed=thing.listed,
                      editors=editors)
 
 class WikiRevisionJsonTemplate(ThingJsonTemplate):

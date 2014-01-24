@@ -144,6 +144,9 @@ def make_map():
 
     mc('/user/:username/:where/:show', controller='user', action='listing')
     
+    mc('/explore', controller='front', action='explore')
+    mc('/api/recommend/feedback', controller='api', action='rec_feedback')
+
     mc('/about/sidebar', controller='front', action='sidebar')
     mc('/about/sticky', controller='front', action='sticky')
     mc('/about/flair', controller='front', action='flairlisting')
@@ -335,7 +338,7 @@ def make_map():
                                  "traffic_viewer|rm_traffic_viewer|"
                                  "edit_campaign|delete_campaign|meta_promo|"
                                  "add_roadblock|rm_roadblock|check_inventory|"
-                                 "refund_campaign")))
+                                 "refund_campaign|terminate_campaign")))
     mc('/api/:action', controller='apiminimal',
        requirements=dict(action="new_captcha"))
     mc('/api/:type', controller='api',

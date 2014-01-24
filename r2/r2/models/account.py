@@ -119,6 +119,7 @@ class Account(Thing):
                      cake_expiration=None,
                      otp_secret=None,
                      state=0,
+                     modmsgtime=None,
                      )
 
     def __eq__(self, other):
@@ -239,7 +240,7 @@ class Account(Thing):
             self._load()
         timestr = timestr or time.strftime(COOKIE_TIMESTAMP_FORMAT)
         id_time = str(self._id) + ',' + timestr
-        to_hash = ','.join((id_time, self.password, g.SECRET))
+        to_hash = ','.join((id_time, self.password, g.secrets["SECRET"]))
         return id_time + ',' + hashlib.sha1(to_hash).hexdigest()
 
     def make_admin_cookie(self, first_login=None, last_request=None):
@@ -248,7 +249,7 @@ class Account(Thing):
         first_login = first_login or datetime.utcnow().strftime(COOKIE_TIMESTAMP_FORMAT)
         last_request = last_request or datetime.utcnow().strftime(COOKIE_TIMESTAMP_FORMAT)
         hashable = ','.join((first_login, last_request, request.ip, request.user_agent, self.password))
-        mac = hmac.new(g.SECRET, hashable, hashlib.sha1).hexdigest()
+        mac = hmac.new(g.secrets["SECRET"], hashable, hashlib.sha1).hexdigest()
         return ','.join((first_login, last_request, mac))
 
     def make_otp_cookie(self, timestamp=None):
@@ -257,7 +258,7 @@ class Account(Thing):
 
         timestamp = timestamp or datetime.utcnow().strftime(COOKIE_TIMESTAMP_FORMAT)
         secrets = [request.user_agent, self.otp_secret, self.password]
-        signature = hmac.new(g.SECRET, ','.join([timestamp] + secrets), hashlib.sha1).hexdigest()
+        signature = hmac.new(g.secrets["SECRET"], ','.join([timestamp] + secrets), hashlib.sha1).hexdigest()
 
         return ",".join((timestamp, signature))
 
@@ -312,6 +313,14 @@ class Account(Thing):
     @property
     def enemies(self):
         return self.enemy_ids()
+
+    @property
+    def is_moderator_somewhere(self):
+        # modmsgtime can be:
+        #   - a date: the user is a mod somewhere and has unread modmail
+        #   - False: the user is a mod somewhere and has no unread modmail
+        #   - None: (the default) the user is not a mod anywhere
+        return self.modmsgtime is not None
 
     # Used on the goldmember version of /prefs/friends
     @memoize('account.friend_rels')
@@ -614,8 +623,17 @@ class Account(Thing):
 
     @property
     def has_gold_subscription(self):
-        return bool(getattr(self, 'gold_subscr_id', None) or
-                    getattr(self, 'stripe_customer_id', None))
+        return bool(getattr(self, 'gold_subscr_id', None))
+
+    @property
+    def has_paypal_subscription(self):
+        return (self.has_gold_subscription and
+                not self.gold_subscr_id.startswith('cus_'))
+
+    @property
+    def has_stripe_subscription(self):
+        return (self.has_gold_subscription and
+                self.gold_subscr_id.startswith('cus_'))
 
 
 class FakeAccount(Account):
@@ -694,7 +712,8 @@ def valid_feed(name, feedhash, path):
             pass
 
 def make_feedhash(user, path):
-    return hashlib.sha1("".join([user.name, user.password, g.FEEDSECRET])
+    return hashlib.sha1("".join([user.name, user.password,
+                                 g.secrets["FEEDSECRET"]])
                    ).hexdigest()
 
 def make_feedurl(user, path, ext = "rss"):
@@ -711,6 +730,9 @@ def valid_login(name, password):
         return False
 
     if not a._loaded: a._load()
+
+    hooks.get_hook("account.spotcheck").call(account=a)
+
     if a._banned:
         return False
     return valid_password(a, password)

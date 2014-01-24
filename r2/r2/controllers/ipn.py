@@ -30,11 +30,12 @@ from sqlalchemy.exc import IntegrityError
 import stripe
 
 from r2.controllers.reddit_base import RedditController
+from r2.lib.base import abort
 from r2.lib.errors import MessageError
 from r2.lib.filters import _force_unicode, _force_utf8
 from r2.lib.log import log_text
 from r2.lib.strings import strings
-from r2.lib.utils import randstr
+from r2.lib.utils import randstr, timeago
 from r2.lib.validator import (
     nop,
     textresponse,
@@ -684,7 +685,7 @@ class GoldPaymentController(RedditController):
             secret_pieces = [goldtype]
             if goldtype == 'gift':
                 secret_pieces.append(recipient.name)
-            secret_pieces.append(secret or '')
+            secret_pieces.append(secret or transaction_id)
             secret = '-'.join(secret_pieces)
 
             try:
@@ -732,6 +733,9 @@ class StripeController(GoldPaymentController):
         'charge.succeeded': 'succeeded',
         'charge.failed': 'failed',
         'charge.refunded': 'refunded',
+        'charge.dispute.created': 'noop',
+        'charge.dispute.updated': 'noop',
+        'charge.dispute.closed': 'noop',
         'customer.created': 'noop',
         'customer.card.created': 'noop',
         'customer.card.deleted': 'noop',
@@ -759,16 +763,23 @@ class StripeController(GoldPaymentController):
         status = event.type
 
         if status == 'invoice.created':
-            # sent 1 hr before a subscription is charged
+            # sent 1 hr before a subscription is charged or immediately for
+            # a new subscription
             invoice = event.data.object
             customer_id = invoice.customer
             account = account_from_stripe_customer_id(customer_id)
-            if not account or (account and account._banned):
+            # if the charge hasn't been attempted (meaning this is 1 hr before
+            # the charge) check that the account can receive the gold
+            if (not invoice.attempted and
+                (not account or (account and account._banned))):
                 # there's no associated account - delete the subscription
                 # to cancel the charge
                 g.log.error('no account for stripe invoice: %s', invoice)
-                customer = stripe.Customer.retrieve(customer_id)
-                customer.delete()
+                try:
+                    customer = stripe.Customer.retrieve(customer_id)
+                    customer.delete()
+                except stripe.InvalidRequestError:
+                    pass
         elif status == 'invoice.payment_failed':
             invoice = event.data.object
             customer_id = invoice.customer
@@ -793,12 +804,25 @@ class StripeController(GoldPaymentController):
             # we'll get an additional failure notification event of
             # "invoice.payment_failed", don't double notify
             return 'dummy', None
+        elif status == 'charge.failed' and not description:
+            # create_customer can POST successfully but fail to create a
+            # customer because the card is declined. This will trigger a
+            # 'charge.failed' notification but without description so we can't
+            # do anything with it
+            return 'dummy', None
         elif invoice_id:
             # subscription charge - special handling
             customer_id = charge.customer
             buyer = account_from_stripe_customer_id(customer_id)
             if not buyer:
-                raise ValueError('no buyer for stripe charge: %s' % charge.id)
+                charge_date = datetime.fromtimestamp(charge.created, tz=g.tz)
+
+                # don't raise exception if charge date is within the past hour
+                # db replication lag may cause the account lookup to fail
+                if charge_date < timeago('1 hour'):
+                    raise ValueError('no buyer for charge: %s' % charge.id)
+                else:
+                    abort(404, "not found")
             webhook = Webhook(transaction_id=transaction_id,
                               subscr_id=customer_id, pennies=pennies,
                               months=months, goldtype='autorenew',
@@ -807,20 +831,19 @@ class StripeController(GoldPaymentController):
         else:
             try:
                 passthrough, buyer_name = description.split('-', 1)
-            except ValueError:
+            except (AttributeError, ValueError):
                 g.log.error('stripe_error on charge: %s', charge)
                 raise
-            
+
             webhook = Webhook(passthrough=passthrough,
                 transaction_id=transaction_id, pennies=pennies, months=months)
             return status, webhook
 
     @classmethod
     @handle_stripe_error
-    def create_customer(cls, form, token, plan=None):
+    def create_customer(cls, form, token):
         description = c.user.name
-        customer = stripe.Customer.create(card=token, description=description,
-                                          plan=plan)
+        customer = stripe.Customer.create(card=token, description=description)
 
         if (customer['active_card']['address_line1_check'] == 'fail' or
             customer['active_card']['address_zip_check'] == 'fail'):
@@ -849,24 +872,30 @@ class StripeController(GoldPaymentController):
     @classmethod
     @handle_stripe_error
     def set_creditcard(cls, form, user, token):
-        if not getattr(user, 'stripe_customer_id', None):
+        if not user.has_stripe_subscription:
             return
 
-        customer = stripe.Customer.retrieve(user.stripe_customer_id)
+        customer = stripe.Customer.retrieve(user.gold_subscr_id)
         customer.card = token
         customer.save()
         return customer
 
     @classmethod
     @handle_stripe_error
-    def cancel_subscription(user):
-        if not getattr(user, 'stripe_customer_id', None):
+    def set_subscription(cls, form, customer, plan_id):
+        subscription = customer.update_subscription(plan=plan_id)
+        return subscription
+
+    @classmethod
+    @handle_stripe_error
+    def cancel_subscription(cls, form, user):
+        if not user.has_stripe_subscription:
             return
 
-        customer = stripe.Customer.retrieve(user.stripe_customer_id)
+        customer = stripe.Customer.retrieve(user.gold_subscr_id)
         customer.delete()
 
-        user.stripe_customer_id = None
+        user.gold_subscr_id = None
         user._commit()
         subject = _('your gold subscription has been cancelled')
         message = _('if you have any questions please email %(email)s')
@@ -903,6 +932,10 @@ class StripeController(GoldPaymentController):
         if period:
             plan_id = (g.STRIPE_MONTHLY_GOLD_PLAN if period == 'monthly'
                        else g.STRIPE_YEARLY_GOLD_PLAN)
+            if c.user.has_gold_subscription:
+                form.set_html('.status',
+                              _('your account already has a gold subscription'))
+                return
         else:
             plan_id = None
             penny_months, days = months_and_days_from_pennies(pennies)
@@ -910,12 +943,16 @@ class StripeController(GoldPaymentController):
                 form.set_html('.status', _('stop trying to trick the form'))
                 return
 
-        customer = self.create_customer(form, token, plan=plan_id)
+        customer = self.create_customer(form, token)
         if not customer:
             return
 
         if period:
-            c.user.stripe_customer_id = customer.id
+            subscription = self.set_subscription(form, customer, plan_id)
+            if not subscription:
+                return
+
+            c.user.gold_subscr_id = customer.id
             c.user._commit()
 
             status = _('subscription created')
@@ -951,8 +988,8 @@ class StripeController(GoldPaymentController):
                    user=VByName('user'))
     def POST_cancel_subscription(self, form, jquery, user):
         if user != c.user and not c.user_is_admin:
-            abort(403, "Forbidden")
-        customer = self.cancel_subscription(user)
+            self.abort403()
+        customer = self.cancel_subscription(form, user)
         if not customer:
             return
 

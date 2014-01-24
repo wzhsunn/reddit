@@ -1,14 +1,21 @@
 r.sponsored = {
-    init: function(isSponsor) {
+    init: function() {
         $("#sr-autocomplete").on("sr-changed blur", function() {
             r.sponsored.fill_campaign_editor()
         })
-        this.isSponsor = isSponsor
         this.inventory = {}
     },
 
-    setup: function(inventory_by_sr) {
+    setup: function(inventory_by_sr, isEmpty) {
         this.inventory = inventory_by_sr
+        if (isEmpty) {
+            this.fill_campaign_editor()
+        }
+    },
+
+    setup_geotargeting: function(regions, metros) {
+        this.regions = regions
+        this.metros = metros
     },
 
     get_dates: function(startdate, enddate) {
@@ -25,11 +32,23 @@ r.sponsored = {
         return dates
     },
 
-    get_check_inventory: function(srname, dates) {
+    get_inventory_key: function(srname, geotarget) {
+        var inventoryKey = srname
+        if (geotarget.country != "") {
+            inventoryKey += "/" + geotarget.country
+        }
+        if (geotarget.metro != "") {
+            inventoryKey += "/" + geotarget.metro
+        }
+        return inventoryKey
+    },
+
+    get_check_inventory: function(srname, geotarget, dates) {
+        var inventoryKey = this.get_inventory_key(srname, geotarget)
         var fetch = _.some(dates, function(date) {
             var datestr = $.datepicker.formatDate('mm/dd/yy', date)
-            if (!(this.inventory[srname] && this.inventory[srname][datestr])) {
-                r.debug('need to fetch ' + datestr + ' for ' + srname)
+            if (!(this.inventory[inventoryKey] && _.has(this.inventory[inventoryKey], datestr))) {
+                r.debug('need to fetch ' + datestr + ' for ' + inventoryKey)
                 return true
             }
         }, this)
@@ -44,17 +63,20 @@ r.sponsored = {
                 url: '/api/check_inventory.json',
                 data: {
                     sr: srname,
+                    country: geotarget.country,
+                    region: geotarget.region,
+                    metro: geotarget.metro,
                     startdate: $.datepicker.formatDate('mm/dd/yy', dates[0]),
                     enddate: $.datepicker.formatDate('mm/dd/yy', end)
                 },
                 success: function(data) {
-                    if (!r.sponsored.inventory[srname]) {
-                        r.sponsored.inventory[srname] = {}
+                    if (!r.sponsored.inventory[inventoryKey]) {
+                        r.sponsored.inventory[inventoryKey] = {}
                     }
 
                     for (var datestr in data.inventory) {
-                        if (!r.sponsored.inventory[srname][datestr]) {
-                            r.sponsored.inventory[srname][datestr] = data.inventory[datestr]
+                        if (!r.sponsored.inventory[inventoryKey][datestr]) {
+                            r.sponsored.inventory[inventoryKey][datestr] = data.inventory[datestr]
                         }
                     }
                 }
@@ -64,35 +86,46 @@ r.sponsored = {
         }
     },
 
-    get_booked_inventory: function($form, srname, isOverride) {
-        var campaign_id36 = $form.find('input[name="campaign_id36"]').val(),
-            campaign_row = $('.existing-campaigns .campaign-row input[name="campaign_id36"]')
-                                .filter('*[value="' + campaign_id36 + '"]')
-                                .parents("tr")
-
-        if (!campaign_row.length) {
+    get_booked_inventory: function($form, srname, geotarget, isOverride) {
+        var campaign_name = $form.find('input[name="campaign_name"]').val()
+        if (!campaign_name) {
             return {}
         }
 
-        if (!campaign_row.hasClass('paid')) {
+        var $campaign_row = $('.existing-campaigns .' + campaign_name)
+        if (!$campaign_row.length) {
             return {}
         }
 
-        var existing_srname = campaign_row.find('*[name="targeting"]').val()
+        if (!$campaign_row.data('paid')) {
+            return {}
+        }
+
+        var existing_srname = $campaign_row.data("targeting")
         if (srname != existing_srname) {
             return {}
         }
 
-        var existingOverride = campaign_row.find('*[name="override"]').val() == "override"
+        var existing_country = $campaign_row.data("country")
+        if (geotarget.country != existing_country) {
+            return {}
+        }
+
+        var existing_metro = $campaign_row.data("metro")
+        if (geotarget.metro != existing_metro) {
+            return {}
+        }
+
+        var existingOverride = $campaign_row.data("override")
         if (isOverride != existingOverride) {
             return {}
         }
 
-        var startdate = campaign_row.find('*[name="startdate"]').val(),
-            enddate = campaign_row.find('*[name="enddate"]').val(),
+        var startdate = $campaign_row.data("startdate"),
+            enddate = $campaign_row.data("enddate"),
             dates = this.get_dates(startdate, enddate),
-            bid = campaign_row.find('*[name="bid"]').val(),
-            cpm = campaign_row.find('*[name="cpm"]').val(),
+            bid = $campaign_row.data("bid"),
+            cpm = $campaign_row.data("cpm"),
             ndays = this.duration_from_dates(startdate, enddate),
             impressions = this.calc_impressions(bid, cpm),
             daily = Math.floor(impressions / ndays),
@@ -117,8 +150,13 @@ r.sponsored = {
             targeted = $form.find('#targeting').is(':checked'),
             target = $form.find('*[name="sr"]').val(),
             srname = targeted ? target : '',
+            country = $('#country').val() || "",
+            region = $('#region').val() || "",
+            metro = $('#metro').val() || "",
+            geotarget = {'country': country, 'region': region, 'metro': metro},
             dates = r.sponsored.get_dates(startdate, enddate),
-            booked = this.get_booked_inventory($form, srname, isOverride)
+            booked = this.get_booked_inventory($form, srname, geotarget, isOverride),
+            inventoryKey = this.get_inventory_key(srname, geotarget)
 
         // bail out in state where targeting is selected but srname
         // has not been entered yet
@@ -127,21 +165,21 @@ r.sponsored = {
             return
         }
 
-        $.when(r.sponsored.get_check_inventory(srname, dates)).done(
+        $.when(r.sponsored.get_check_inventory(srname, geotarget, dates)).done(
             function() {
                 if (isOverride) {
                     // do a simple sum of available inventory for override
                     var available = _.reduce(_.map(dates, function(date){
                         var datestr = $.datepicker.formatDate('mm/dd/yy', date),
                             daily_booked = booked[datestr] || 0
-                        return r.sponsored.inventory[srname][datestr] + daily_booked
+                        return r.sponsored.inventory[inventoryKey][datestr] + daily_booked
                     }), function(memo, num){ return memo + num; }, 0)
                 } else {
                     // calculate conservative inventory estimate
                     var minDaily = _.min(_.map(dates, function(date) {
                         var datestr = $.datepicker.formatDate('mm/dd/yy', date),
                             daily_booked = booked[datestr] || 0
-                        return r.sponsored.inventory[srname][datestr] + daily_booked
+                        return r.sponsored.inventory[inventoryKey][datestr] + daily_booked
                     }))
                     var available = minDaily * ndays
                 }
@@ -203,7 +241,15 @@ r.sponsored = {
     },
 
     get_cpm: function($form) {
-        return parseInt($form.find('*[name="cpm"]').val())
+        var baseCpm = parseInt($("#bid").data("base_cpm")),
+            geotargetCpm = parseInt($("#bid").data("geotarget_cpm")),
+            isGeotarget = $('#country').val() != ''
+
+        if (isGeotarget) {
+            return geotargetCpm
+        } else {
+            return baseCpm
+        }
     },
 
     on_date_change: function() {
@@ -230,9 +276,9 @@ r.sponsored = {
             cpm = this.get_cpm($form),
             ndays = this.get_duration($form),
             impressions = this.calc_impressions(bid, cpm),
-            selected = $form.find('*[name="priority"]:checked'),
-            isOverride = selected.attr("override") == "override",
-            isCpm = selected.attr("cpm") == "cpm"
+            priority = $form.find('*[name="priority"]:checked'),
+            isOverride = priority.data("override"),
+            isCpm = priority.data("cpm")
 
         $(".duration").text(ndays + " " + ((ndays > 1) ? r._("days") : r._("day")))
         $(".price-info").text(r._("$%(cpm)s per 1,000 impressions").format({cpm: (cpm/100).toFixed(2)}))
@@ -263,7 +309,7 @@ r.sponsored = {
     },
 
     hide_cpm: function() {
-        var priceRow = $('#cpm').parent('td').parent('tr'),
+        var priceRow = $('.price-info').parent('td').parent('tr'),
             budgetRow = $('#bid').parent('td').parent('tr'),
             impressionsRow = $('#impressions').parent('td').parent('tr')
         priceRow.hide("slow")
@@ -272,7 +318,7 @@ r.sponsored = {
     },
 
     show_cpm: function() {
-        var priceRow = $('#cpm').parent('td').parent('tr'),
+        var priceRow = $('.price-info').parent('td').parent('tr'),
             budgetRow = $('#bid').parent('td').parent('tr'),
             impressionsRow = $('#impressions').parent('td').parent('tr')
         priceRow.show("slow")
@@ -291,6 +337,61 @@ r.sponsored = {
     },
 
     priority_changed: function() {
+        this.fill_campaign_editor()
+    },
+
+    update_regions: function() {
+        var $country = $('#country'),
+            $region = $('#region'),
+            $metro = $('#metro')
+
+        $region.find('option').remove().end().hide()
+        $metro.find('option').remove().end().hide()
+        $region.prop('disabled', true)
+        $metro.prop('disabled', true)
+
+        if (_.has(this.regions, $country.val())) {
+            _.each(this.regions[$country.val()], function(item) {
+                var code = item[0],
+                    name = item[1],
+                    selected = item[2]
+
+                $('<option/>', {value: code, selected: selected}).text(name).appendTo($region)
+            })
+            $region.prop('disabled', false)
+            $region.show()
+        }
+    },
+
+    update_metros: function() {
+        var $region = $('#region'),
+            $metro = $('#metro')
+
+        $metro.find('option').remove().end().hide()
+        if (_.has(this.metros, $region.val())) {
+            _.each(this.metros[$region.val()], function(item) {
+                var code = item[0],
+                    name = item[1],
+                    selected = item[2]
+
+                $('<option/>', {value: code, selected: selected}).text(name).appendTo($metro)
+            })
+            $metro.prop('disabled', false)
+            $metro.show()
+        }
+    },
+
+    country_changed: function() {
+        this.update_regions()
+        this.fill_campaign_editor()
+    },
+
+    region_changed: function() {
+        this.update_metros()
+        this.fill_campaign_editor()
+    },
+
+    metro_changed: function() {
         this.fill_campaign_editor()
     },
 
@@ -375,172 +476,28 @@ function check_enddate(startdate, enddate) {
   $("#datepicker-" + enddate.attr("id")).datepicker("destroy");
 }
 
-
 (function($) {
+    $.update_campaign = function(campaign_name, campaign_html) {
+        cancel_edit(function() {
+            var $existing = $('.existing-campaigns .' + campaign_name),
+                tableWasEmpty = $('.existing-campaigns table tr.campaign-row').length == 0
 
-function get_flag_class(flags) {
-    var css_class = "campaign-row";
-    if(flags.free) {
-        css_class += " free";
-    }
-    if(flags.live) {
-        css_class += " live";
-    }
-    if(flags.complete) {
-        css_class += " complete";
-    }
-    else if (flags.paid) {
-            css_class += " paid";
-    }
-    if (flags.sponsor) {
-        css_class += " sponsor";
-    }
-    if (flags.refund) {
-        css_class += " refund";
-    }
-    if (flags.non_cpm) {
-        css_class += " non_cpm";
-    }
-    return css_class
-}
-
-$.new_campaign = function(campaign_id36, start_date, end_date, duration,
-                          bid, spent, cpm, targeting, priority, override, flags) {
-    cancel_edit(function() {
-      var data =('<input type="hidden" name="startdate" value="' + 
-                 start_date +'"/>' + 
-                 '<input type="hidden" name="enddate" value="' + 
-                 end_date + '"/>' + 
-                 '<input type="hidden" name="bid" value="' + bid + '"/>' +
-                 '<input type="hidden" name="cpm" value="' + cpm + '"/>' +
-                 '<input type="hidden" name="targeting" value="' + 
-                 (targeting || '') + '"/>' +
-                 '<input type="hidden" name="priority" value="' + priority + '"/>' +
-                 '<input type="hidden" name="override" value="' + override + '"/>' +
-                 '<input type="hidden" name="campaign_id36" value="' + campaign_id36 + '"/>');
-      if (flags && flags.pay_url) {
-          data += ("<input type='hidden' name='pay_url' value='" + 
-                   flags.pay_url + "'/>");
-      }
-      if (flags && flags.view_live_url) {
-          data += ("<input type='hidden' name='view_live_url' value='" + 
-                   flags.view_live_url + "'/>");
-      }
-      if (flags && flags.refund_url) {
-          data += ("<input type='hidden' name='refund_url' value='" + 
-                   flags.refund_url + "'/>");
-      }
-      var row = [start_date, end_date, duration, priority, "$" + bid, "$" + spent, targeting, data];
-      $(".existing-campaigns .error").hide();
-      var css_class = get_flag_class(flags);
-      $(".existing-campaigns table").show()
-      .insert_table_rows([{"id": "", "css_class": css_class, 
-                           "cells": row}], -1);
-      check_number_of_campaigns();
-      $.set_up_campaigns()
-        });
-   return $;
-};
-
-$.update_campaign = function(campaign_id36, start_date, end_date,
-                             duration, bid, spent, cpm, targeting, priority,
-                             override, flags) {
-    cancel_edit(function() {
-            $('.existing-campaigns input[name="campaign_id36"]')
-                .filter('*[value="' + (campaign_id36 || '0') + '"]')
-                .parents("tr").removeClass()
-            .addClass(get_flag_class(flags))
-                .children(":first").html(start_date)
-                .next().html(end_date)
-                .next().html(duration)
-                .next().html(priority)
-                .next().html("$" + bid).removeClass()
-                .next().html("$" + spent)
-                .next().html(targeting)
-                .next()
-                .find('*[name="startdate"]').val(start_date).end()
-                .find('*[name="enddate"]').val(end_date).end()
-                .find('*[name="targeting"]').val(targeting).end()
-                .find('*[name="priority"]').val(priority).end()
-                .find('*[name="override"]').val(override).end()
-                .find('*[name="bid"]').val(bid).end()
-                .find('*[name="cpm"]').val(cpm).end()
-                .find("button, span").remove();
-            $.set_up_campaigns();
-        });
-};
-
-$.set_up_campaigns = function() {
-    var edit = "<button>edit</button>";
-    var del = "<button>delete</button>";
-    var pay = "<button>pay</button>";
-    var free = "<button>free</button>";
-    var repay = "<button>change</button>";
-    var view = "<button>view live</button>";
-    var refund = "<button>refund</button>";
-    $(".existing-campaigns tr").each(function() {
-            var tr = $(this);
-            var td = $(this).find("td:last");
-            var bid_td = $(this).find("td:first").next().next().next().next()
-                .addClass("bid");
-            if(td.length && ! td.children("button, span").length ) {
-                if(tr.hasClass("live")) {
-                    $(td).append($(view).addClass("view fancybutton")
-                            .click(function() { view_campaign(tr) }));
-                }
-
-                if (tr.hasClass('refund')) {
-                    $(bid_td).append($(refund).addClass("refund fancybutton")
-                            .click(function() { refund_campaign(tr) }));
-                }
-
-                /* once paid, we shouldn't muck around with the campaign */
-                if(!tr.hasClass("complete") && !tr.hasClass("live")) {
-                    if (!tr.hasClass("non_cpm")) {
-                        if (tr.hasClass("sponsor") && !tr.hasClass("free")) {
-                            $(bid_td).append($(free).addClass("free")
-                                         .click(function() { free_campaign(tr) }))
-                        }
-                        else if (!tr.hasClass("paid")) {
-                            $(bid_td).prepend($(pay).addClass("pay fancybutton")
-                                         .click(function() { pay_campaign(tr) }));
-                        } else if (tr.hasClass("free")) {
-                            $(bid_td).addClass("free paid")
-                                .prepend("<span class='info'>freebie</span>");
-                        } else {
-                            (bid_td).addClass("paid")
-                                .prepend($(repay).addClass("pay fancybutton")
-                                         .click(function() { pay_campaign(tr) }));
-                        }
-                    }
-                    var e = $(edit).addClass("edit fancybutton")
-                        .click(function() { edit_campaign(tr); });
-                    var d = $(del).addClass("d fancybutton")
-                        .click(function() { del_campaign(tr); });
-                    $(td).append(e).append(d);
-                } else {
-                    if (tr.hasClass("complete")) {
-                      $(td).append("<span class='info'>complete</span>");
-                    }
-                    if (!tr.hasClass("non_cpm")) {
-                        $(bid_td).addClass("paid")
-                    }
-                    /* sponsors can always edit */
-                    if (tr.hasClass("sponsor")) {
-                        var e = $(edit).addClass("edit fancybutton")
-                            .click(function() { edit_campaign(tr); });
-                        $(td).append(e);
-                    }
-                }
+            if ($existing.length) {
+                $existing.replaceWith(campaign_html)
+                $existing.fadeIn()
+            } else {
+                $(campaign_html).hide()
+                .insertAfter('.existing-campaigns tr:last')
+                .css('display', 'table-row')
+                .fadeIn()
             }
-        });
-    if (!r.sponsored.isSponsor) {
-        $('.existing-campaigns tr td:nth-child(4), .existing-campaigns tr th:nth-child(4)').hide()
+
+            if (tableWasEmpty) {
+                $('.existing-campaigns p.error').hide()
+                $('.existing-campaigns table').fadeIn()
+            }
+        })
     }
-    return $;
-
-}
-
 }(jQuery));
 
 function detach_campaign_form() {
@@ -584,72 +541,85 @@ function cancel_edit(callback) {
     }
 }
 
-function del_campaign(elem) {
-    var campaign_id36 = $(elem).find('*[name="campaign_id36"]').val();
-    var link_id = $("#campaign").find('*[name="link_id"]').val();
+function del_campaign($campaign_row) {
+    var link_id36 = $("#campaign").find('*[name="link_id36"]').val(),
+        campaign_id36 = $campaign_row.data('campaign_id36')
     $.request("delete_campaign", {"campaign_id36": campaign_id36,
-                                  "link_id": link_id},
+                                  "link_id36": link_id36},
               null, true, "json", false);
-    $(elem).children(":first").delete_table_row(check_number_of_campaigns);
+    $campaign_row.children(":first").delete_table_row(check_number_of_campaigns);
 }
 
 
-function edit_campaign(elem) {
-    /* find the table row in question */
-    var tr = $(elem).get(0);
+function edit_campaign($campaign_row) {
+    cancel_edit(function() {
+        var campaign = detach_campaign_form()
 
-    if ($("#campaign").parents('tr:first').get(0) != tr) {
+        $(".existing-campaigns table")
+            .insert_table_rows([{
+                "id": "edit-campaign-tr",
+                "css_class": "",
+                "cells": [""]
+            }], $campaign_row.get(0).rowIndex + 1)
 
-        cancel_edit(function() {
+        var editRow = $("#edit-campaign-tr")
+        editRow.children('td:first').attr("colspan", 8).append(campaign)
+        $campaign_row.fadeOut(function() {
+            /* fill inputs from data in campaign row */
+            _.each(['startdate', 'enddate', 'bid', 'campaign_id36', 'campaign_name'],
+                function(input) {
+                    var val = $campaign_row.data(input),
+                        $input = campaign.find('*[name="' + input + '"]')
+                    $input.val(val)
+            })
 
-            /* copy the campaign element */
-            var campaign = detach_campaign_form();
+            /* set priority */
+            var priorities = campaign.find('*[name="priority"]'),
+                campPriority = $campaign_row.data("priority")
 
-            $(".existing-campaigns table")
-                .insert_table_rows([{"id": "edit-campaign-tr",
-                                "css_class": "", "cells": [""]}], 
-                    tr.rowIndex + 1);
-            $("#edit-campaign-tr").children('td:first')
-                .attr("colspan", 8).append(campaign).end()
-                .prev().fadeOut(function() { 
-                        var data_tr = $(this);
-                        var c = $("#campaign");
-                        $.map(['startdate', 'enddate', 'bid', 'cpm', 'campaign_id36'],
-                              function(i) {
-                                  i = '*[name="' + i + '"]';
-                                  c.find(i).val(data_tr.find(i).val());
-                              });
-                        var priorities = c.find('*[name="priority"]'),
-                            campPriority = data_tr.find('*[name="priority"]').val()
-                        priorities.filter('*[value="' + campPriority + '"]')
-                            .prop("checked", "checked")
-                        /* check if targeting is turned on */
-                        var targeting = data_tr
-                            .find('*[name="targeting"]').val();
-                        var radios=c.find('*[name="targeting"]');
-                        if (targeting) {
-                            radios.filter('*[value="one"]')
-                                .prop("checked", "checked");
-                            c.find('*[name="sr"]').val(targeting).prop("disabled", "").end()
-                                .find(".targeting").show();
-                        }
-                        else {
-                            radios.filter('*[value="none"]')
-                                .prop("checked", "checked");
-                            c.find('*[name="sr"]').val("").prop("disabled", "disabled").end()
-                                .find(".targeting").hide();
-                        }
-                        /* attach the dates to the date widgets */
-                        init_startdate();
-                        init_enddate();
-                        c.find('button[name="save"]').show().end()
-                            .find('button[name="create"]').hide().end();
-                        r.sponsored.fill_campaign_editor();
-                        c.fadeIn();
-                    } );
+            priorities.filter('*[value="' + campPriority + '"]')
+                .prop("checked", "checked")
+
+            /* check if targeting is turned on */
+            var targeting = $campaign_row.data("targeting"),
+                radios = campaign.find('*[name="targeting"]');
+            if (targeting) {
+                radios.filter('*[value="one"]')
+                    .prop("checked", "checked");
+                campaign.find('*[name="sr"]').val(targeting).prop("disabled", "").end()
+                    .find(".targeting").show();
+            } else {
+                radios.filter('*[value="none"]')
+                    .prop("checked", "checked");
+                campaign.find('*[name="sr"]').val("").prop("disabled", "disabled").end()
+                    .find(".targeting").hide();
             }
-            );
-    }
+
+            /* set geotargeting */
+            var country = $campaign_row.data("country"),
+                region = $campaign_row.data("region"),
+                metro = $campaign_row.data("metro")
+            campaign.find("#country").val(country)
+            r.sponsored.update_regions()
+            if (region != "") {
+                campaign.find("#region").val(region)
+                r.sponsored.update_metros()
+
+                if (metro != "") {
+                    campaign.find("#metro").val(metro)
+                }
+            }
+
+            /* attach the dates to the date widgets */
+            init_startdate();
+            init_enddate();
+
+            campaign.find('button[name="save"]').show().end()
+                .find('button[name="create"]').hide().end();
+            campaign.fadeIn();
+            r.sponsored.fill_campaign_editor();
+        })
+    })
 }
 
 function check_number_of_campaigns(){
@@ -669,41 +639,41 @@ function create_campaign() {
         return;
     }
     cancel_edit(function() {;
-            var base_cpm = $("#bid").data("base_cpm")
+            var minBid = $("#bid").data("min_bid")
+
             init_startdate();
             init_enddate();
             $("#campaign")
-                .find('button[name="edit"]').hide().end()
+                .find('button[name="save"]').hide().end()
                 .find('button[name="create"]').show().end()
                 .find('input[name="campaign_id36"]').val('').end()
+                .find('input[name="campaign_name"]').val('').end()
                 .find('input[name="sr"]').val('').prop("disabled", "disabled").end()
                 .find('input[name="targeting"][value="none"]').prop("checked", "checked").end()
-                .find('input[name="priority"][default="default"]').prop("checked", "checked").end()
-                .find('input[name="bid"]').val($("#bid").data("min_bid") * 5).end()
+                .find('input[name="priority"][data-default="true"]').prop("checked", "checked").end()
+                .find('input[name="bid"]').val(minBid * 5).end()
                 .find(".targeting").hide().end()
-                .find('input[name="cpm"]').val(base_cpm).end()
+                .find('select[name="country"]').val('all').end()
+                .find('select[name="region"]').hide().end()
+                .find('select[name="metro"]').hide().end()
                 .fadeIn();
             r.sponsored.fill_campaign_editor();
         });
 }
 
-function free_campaign(elem) {
-    var campaign_id36 = $(elem).find('*[name="campaign_id36"]').val();
-    var link_id = $("#campaign").find('*[name="link_id"]').val();
-    $.request("freebie", {"campaign_id36": campaign_id36, "link_id": link_id},
+function free_campaign($campaign_row) {
+    var link_id36 = $("#campaign").find('*[name="link_id36"]').val(),
+        campaign_id36 = $campaign_row.data('campaign_id36')
+    $.request("freebie", {"campaign_id36": campaign_id36, "link_id36": link_id36},
               null, true, "json", false);
-    $(elem).find(".free").fadeOut();
+    $campaign_row.find(".free").fadeOut();
     return false; 
 }
 
-function pay_campaign(elem) {
-    $.redirect($(elem).find('input[name="pay_url"]').val());
-}
-
-function view_campaign(elem) {
-    $.redirect($(elem).find('input[name="view_live_url"]').val());
-}
-
-function refund_campaign(elem) {
-    $.redirect($(elem).find('input[name="refund_url"]').val());
+function terminate_campaign($campaign_row) {
+    var link_id36 = $("#campaign").find('*[name="link_id36"]').val(),
+        campaign_id36 = $campaign_row.data('campaign_id36')
+    $.request("terminate_campaign", {"campaign_id36": campaign_id36,
+                                     "link_id36": link_id36},
+              null, true, "json", false);
 }

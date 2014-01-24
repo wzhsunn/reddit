@@ -189,9 +189,13 @@ class OAuth2Scope:
         },
     }
 
-    def __init__(self, scope_str=None):
+    def __init__(self, scope_str=None, subreddits=None, scopes=None):
         if scope_str:
             self._parse_scope_str(scope_str)
+        elif subreddits is not None or scopes is not None:
+            self.subreddit_only = bool(subreddits)
+            self.subreddits = subreddits
+            self.scopes = scopes
         else:
             self.subreddit_only = False
             self.subreddits = set()
@@ -219,6 +223,31 @@ class OAuth2Scope:
 
     def details(self):
         return [(scope, self.scope_info[scope]) for scope in self.scopes]
+
+    @classmethod
+    def merge_scopes(cls, scopes):
+        """Return a by-subreddit dict representing merged OAuth2Scopes.
+
+        Takes an iterable of OAuth2Scopes. For each of those,
+        if it defines scopes on multiple subreddits, it is split
+        into one OAuth2Scope per subreddit. If multiple passed in
+        OAuth2Scopes reference the same scopes, they'll be combined.
+
+        """
+        merged = {}
+        for scope in scopes:
+            srs = scope.subreddits if scope.subreddit_only else (None,)
+            for sr in srs:
+                if sr in merged:
+                    merged[sr].scopes.update(scope.scopes)
+                else:
+                    new_scope = cls()
+                    new_scope.subreddits = {sr}
+                    new_scope.scopes = scope.scopes
+                    if sr is not None:
+                        new_scope.subreddit_only = True
+                    merged[sr] = new_scope
+        return merged
 
 
 class OAuth2Client(Token):
@@ -345,6 +374,28 @@ class OAuth2Client(Token):
                  token.date + datetime.timedelta(seconds=token._ttl)
                      if token._ttl else None)
                 for token in tokens]
+
+    @classmethod
+    def _by_user_grouped(cls, account):
+        token_tuples = cls._by_user(account)
+        clients = {}
+        for client, scope, expiration in token_tuples:
+            if client._id in clients:
+                client_data = clients[client._id]
+                client_data['scopes'].append(scope)
+            else:
+                client_data = {'scopes': [scope], 'access_tokens': 0,
+                               'refresh_tokens': 0, 'client': client}
+                clients[client._id] = client_data
+            if expiration:
+                client_data['access_tokens'] += 1
+            else:
+                client_data['refresh_tokens'] += 1
+
+        for client_data in clients.itervalues():
+            client_data['scopes'] = OAuth2Scope.merge_scopes(client_data['scopes'])
+
+        return clients
 
     def revoke(self, account):
         """Revoke all of the outstanding OAuth2AccessTokens associated with this client and user Account."""

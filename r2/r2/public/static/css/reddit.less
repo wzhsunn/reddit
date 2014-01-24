@@ -950,6 +950,184 @@ a.author { margin-right: 0.5em; }
 
 .thing.stickied a.title, .thing.stickied a.title:visited, .thing.stickied a.title.visited { font-weight: bold; color: @moderator-color; }
 
+body.with-listing-chooser.explore-page #header .pagename {
+    position: static;
+}
+
+.explore-header {
+    margin-bottom: 7px;
+    padding: 5px 0;
+    font-weight: bold;
+
+    .explore-title {
+      font-size: 1.3em;
+    }
+    .explore-discuss-link {
+      float: right;
+      margin: 0.3em 10px 0 0;
+    }
+}
+
+.explore-item {
+    margin-bottom: 1em;
+
+    .explore-label {
+        border-radius: 2px;
+        display: inline-block;
+        margin: 0 5px 1px 0;
+        padding: 1px 2px 2px;
+    }
+
+    .explore-label-type, .explore-label-link {
+        padding: 0 5px;
+    }
+
+    .explore-sr-details {
+        color: #777;
+        display: inline-block;
+        font-size: x-small;
+        font-weight: normal;
+        margin-left: 3px;
+    }
+
+    .explore-feedback {
+        display: inline-block;
+        .fancy-toggle-button .add, .fancy-toggle-button .remove {
+            background-color: transparent;
+            background-image: none;
+            border: none;
+            color: #aaa;
+            border: 1px solid #ccc;
+            border-radius: 2px;
+            margin-left: 10px;
+            padding-top: 0;
+
+            .option {
+                line-height: 7px;
+            }
+
+            &:hover {
+                color: white;
+                border: 1px solid #444;
+            }
+        }
+        .fancy-toggle-button .add {
+            &:hover {
+                background-image: url(../bg-button-add.png); /* SPRITE stretch-x */
+            }
+        }
+        .fancy-toggle-button .remove {
+            &:hover {
+                background-image: url(../bg-button-remove.png); /* SPRITE stretch-x */
+            }
+        }
+        .subscribe-button {
+            display: inline-block;
+            margin: 0 4px 0 0;
+        }
+    }
+
+    .explore-feedback-dismiss {
+        cursor: pointer;
+        display: inline-block;
+        text-indent: -9999px;
+        width: 9px;
+        height: 9px;
+        background-image: url(../close-small.png);  /* SPRITE */
+        background-repeat: no-repeat;
+        opacity: .3;
+        margin-left: 4px;
+        vertical-align: middle;
+        border: 3px solid transparent;
+        &:hover {
+            opacity: 1;
+        }
+    }
+
+    .explore-sr {
+        display: inline-block;
+        font-size: 1.1em;
+        font-weight: bold;
+        margin-bottom: 3px;
+        padding: 2px 4px;
+        line-height: 13px;
+        height: 18px;
+    }
+
+    .midcol {
+        display: none;
+    }
+
+    .rank {
+        display: none;
+    }
+}
+
+.explore-comment {
+    .explore-label {
+        background-color: #cee3f8;
+        border: solid thin #5f99cf;
+    }
+    .tagline, .buttons, .thumbnail, .expando-button {
+        display: none;
+    }
+    .comment {
+        border-left: solid 2px #eee;
+        color: #888;
+        margin: -3px 0 3px 5px;
+        max-height: 100px;
+        overflow-x: hidden;
+        overflow-y: hidden;
+        position: relative;
+        .md {
+            font-size: x-small;
+            padding-bottom: 2px;
+            p {
+                margin: 5px;
+            }
+        }
+    }
+    /* make long comment boxes fade to white instead of cutting off mid-line */
+    .comment-fade {
+        background: -moz-linear-gradient(bottom, rgba(255,255,255,1) 0%, rgba(255,255,255,0) 100%);
+        background: -webkit-gradient(linear, left bottom, left top, color-stop(0%,rgba(255,255,255,1)), color-stop(100%,rgba(255,255,255,0)));
+        bottom: 0;
+        border: none;
+        height: 10px;
+        position: absolute;
+        width: 100%;
+    }
+    .comment-link {
+        color: #888;
+        display: inline-block;
+        font-weight: bold;
+        padding: 0 0 8px 5px;
+    }
+}
+
+.explore-page.res-nightmode .comment-fade {
+    display: none;
+}
+
+.explore-hot .explore-label {
+    background-color: #fff088;
+    border: solid thin #c4b487;
+}
+
+.explore-rising .explore-label {
+    background-color: #d6fbcb;
+    border: solid thin #485;
+}
+
+.explore-discovery .explore-label {
+    background-color: #dedede;
+    border: solid thin #aaa;
+}
+
+.explore-subscribe-bubble {
+    margin-left: 22px;
+}
+
 .sitetable { list-style-type: none; }
 .ajaxhook { position: absolute; top: -1000px; left: 0px; }
 
@@ -1084,20 +1262,34 @@ a.author { margin-right: 0.5em; }
         }
     }
 
-    &.anchor-right {
+    &.anchor-right, &.anchor-left {
         &:before, &:after {
             top: 8px;
             border: 9px solid transparent;
         }
 
-        &:before {
-            right: -19px;
-            border-left-color: gray;
+        &.anchor-right {
+            &:before {
+                right: -19px;
+                border-left-color: gray;
+            }
+
+            &:after {
+                right: -18px;
+                border-left-color: white;
+            }
         }
 
-        &:after {
-            right: -18px;
-            border-left-color: white;
+        &.anchor-left {
+            &:before {
+                left: -19px;
+                border-right-color: gray;
+            }
+
+            &:after {
+                left: -18px;
+                border-right-color: white;
+            }
         }
     }
 }
@@ -3445,7 +3637,7 @@ body.contact-us-page {
 }
 
 #inner_toolbar {
-    #reddit_panel, #reddit_link {
+    #reddit_panel, #reddit_link_container, #reddit_link {
         position: absolute;
         height: 100%;
         border: none;
@@ -3455,7 +3647,7 @@ body.contact-us-page {
         width: 0;
     }
 
-    #reddit_link {
+    #reddit_link_container, #reddit_link {
         width: 100%;
     }
 
@@ -3464,9 +3656,10 @@ body.contact-us-page {
             width: 400px;
         }
 
-        #reddit_link {
+        #reddit_link_container {
             left: 400px;
             right: 0;
+            width: auto;
         }
     }
 }
@@ -4410,6 +4603,7 @@ ul.tabmenu.formtab {
 .campaign { 
     border: 1px solid #336699; 
     background-color: #EFF7FF;
+    width: 570px;
     padding: 5px;
     -webkit-box-shadow: inset 0px 1px 0px hsla(0,0%,100%,.8), 0px 1px 0px hsla(0,0%,100%,.6);
     -moz-box-shadow: inset 0px 1px 0px hsla(0,0%,100%,.8), 0px 1px 0px hsla(0,0%,100%,.6);
@@ -4427,22 +4621,19 @@ ul.tabmenu.formtab {
     border: none;
 }
 
-.existing-campaigns td.bid { 
-    background: none no-repeat scroll center right;
-    padding-right: 15px;
-}
+.existing-campaigns  { 
+    td.campaign-bid .bid-amount {
+        display: block;
+    }
 
-.existing-campaigns td.bid.paid { 
-    background-image: url(../green-check.png);  
+    td.campaign-bid.paid {
+        background: url(../green-check.png) no-repeat scroll center right;
+    }
 }
 
 .existing-campaigns tr.refund {
     color: red;
     font-weight: bold;
-}
-
-.existing-campaigns td.bid .info{ 
-    margin-right: 3px; 
 }
 
 .prefright p.minimum-spend {
@@ -4462,9 +4653,10 @@ ul.tabmenu.formtab {
 }
 
 .existing-campaigns > table > tbody > tr > td { 
-    text-align: right;
+    text-align: center;
     border: 1px solid #369;
-    padding: 1px 5px;
+    padding: 5px;
+    max-width: 120px;
 }
 .existing-campaigns > table > tbody > tr#edit-campaign-tr > td { 
     text-align: left;
@@ -4543,6 +4735,12 @@ ul.tabmenu.formtab {
 #campaign label,
 #campaign li {
     font-size: small;
+}
+
+#campaign .geotarget-select {
+    float: left;
+    clear: left;
+    margin-top: 2px;
 }
 
 /***traffic stuff***/
@@ -5153,6 +5351,7 @@ div #campaign-field {
 
 .create-promotion .help p { 
     margin: 5px;
+    width: 580px;
 }
 
 .create-promotion .help a.help { 
@@ -5165,8 +5364,8 @@ div #campaign-field {
 
 .create-promo {
     float: left;
-    width: 570px;
     margin-right: 20px;
+    min-width: 620px;
 }
 
 .create-promo .infobar { 
@@ -5189,7 +5388,11 @@ div #campaign-field {
 }
 
 #promo-form {
-    .linefield, .usertext-edit {
+    .linefield {
+        width: 620px;
+    }
+
+    .usertext-edit {
         width: auto;
     }
 }
@@ -6683,6 +6886,7 @@ body:not(.gold) .allminus-link {
 .modactions.wikibanned,
 .modactions.wikiunbanned,
 .modactions.wikicontributor,
+.modactions.wikipagelisted,
 .modactions.removewikicontributor,
 .modactions.ignorereports,
 .modactions.unignorereports,
@@ -6728,6 +6932,7 @@ body:not(.gold) .allminus-link {
 .modactions.removecontributor {
     background-image: url(../modactions_removecontributor.png); /* SPRITE */
 }
+.modactions.wikipagelisted,
 .modactions.editsettings {
     background-image: url(../modactions_editsettings.png); /* SPRITE */
 }
@@ -7261,7 +7466,7 @@ body:not(.gold) .allminus-link {
     font-size: x-small;
 }
 
-.developed-app.collapsed, .authorized-app { height: 100px; }
+.developed-app.collapsed, .authorized-app { min-height: 100px; }
 .developed-app .collapsed { display: none; }
 
 .developed-app .ajax-upload-form {
@@ -7271,7 +7476,7 @@ body:not(.gold) .allminus-link {
 .app-details {
     display: inline-block;
     width: 200px;
-    height: 72px;
+    min-height: 72px;
     margin-left: 1em;
     vertical-align: top;
 }

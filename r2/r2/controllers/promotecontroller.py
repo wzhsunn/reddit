@@ -46,6 +46,7 @@ from r2.lib.pages import (
     PromoteReport,
     Reddit,
     RefundPage,
+    RenderableCampaign,
     Roadblocks,
     UploadedImage,
 )
@@ -74,6 +75,7 @@ from r2.lib.validator import (
     VInt,
     VLength,
     VLink,
+    VLocation,
     VModhash,
     VOneOf,
     VPriority,
@@ -95,7 +97,6 @@ from r2.models import (
     Frontpage,
     get_promote_srid,
     Link,
-    LiveAdWeights,
     Message,
     NotFound,
     PromoCampaign,
@@ -113,15 +114,16 @@ def campaign_has_oversold_error(form, campaign):
     target = Subreddit._by_name(campaign.sr_name) if campaign.sr_name else None
     return has_oversold_error(form, campaign, campaign.start_date,
                               campaign.end_date, campaign.bid, campaign.cpm,
-                              target)
+                              target, campaign.location)
 
 
-def has_oversold_error(form, campaign, start, end, bid, cpm, target):
+def has_oversold_error(form, campaign, start, end, bid, cpm, target, location):
     ndays = (to_date(end) - to_date(start)).days
     total_request = calc_impressions(bid, cpm)
     daily_request = int(total_request / ndays)
     oversold = inventory.get_oversold(target or Frontpage, start, end,
-                                      daily_request, ignore=campaign)
+                                      daily_request, ignore=campaign,
+                                      location=location)
 
     if oversold:
         min_daily = min(oversold.values())
@@ -148,32 +150,24 @@ class PromoteController(ListingController):
 
     @classmethod
     @memoize('live_by_subreddit', time=300)
+    def _live_by_subreddit(cls, sr_names):
+        promotuples = promote.get_live_promotions(sr_names)
+        return [pt.link for pt in promotuples]
+
     def live_by_subreddit(cls, sr):
-        if sr == Frontpage:
-            sr_id = ''
-        else:
-            sr_id = sr._id
-        r = LiveAdWeights.get([sr_id])
-        return [i.link for i in r[sr_id]]
+        sr_names = [''] if sr == Frontpage else [sr.name]
+        return cls._live_by_subreddit(sr_names)
 
     @classmethod
-    @memoize('subreddits_with_promos', time=3600)
-    def subreddits_with_promos(cls):
-        sr_ids = LiveAdWeights.get_live_subreddits()
-        srs = Subreddit._byID(sr_ids, return_dict=False)
-        sr_names = sorted([sr.name for sr in srs], key=lambda s: s.lower())
-        return sr_names
-
-    @classmethod
-    @memoize('house_campaigns', time=60)
-    def get_house_campaigns(cls):
+    @memoize('house_link_names', time=60)
+    def get_house_link_names(cls):
         now = promote.promo_datetime_now()
         pws = PromotionWeights.get_campaigns(now)
         campaign_ids = {pw.promo_idx for pw in pws}
-        campaigns = PromoCampaign._byID(campaign_ids, data=True,
-                                        return_dict=False)
-        campaigns = [camp for camp in campaigns if not camp.priority.cpm]
-        return campaigns
+        q = PromoCampaign._query(PromoCampaign.c._id.in_(campaign_ids),
+                                 PromoCampaign.c.priority_name == 'house',
+                                 data=True)
+        return [Link._fullname_from_id36(to36(camp.link_id)) for camp in q]
 
     @property
     def menus(self):
@@ -189,13 +183,19 @@ class PromoteController(ListingController):
                         type='lightdrop')]
 
         if self.sort == 'live_promos' and c.user_is_sponsor:
-            sr_names = self.subreddits_with_promos()
-            buttons = [NavButton(name, name) for name in sr_names]
-            frontbutton = NavButton('FRONTPAGE', Frontpage.name,
-                                    aliases=['/promoted/live_promos/%s' %
-                                             urllib.quote(Frontpage.name)])
-            buttons.insert(0, frontbutton)
-            buttons.insert(0, NavButton('all', ''))
+            srnames = promote.all_live_promo_srnames()
+            buttons = [NavButton('all', '')]
+            try:
+                srnames.remove('')
+                frontbutton = NavButton('FRONTPAGE', Frontpage.name,
+                                        aliases=['/promoted/live_promos/%s' %
+                                                 urllib.quote(Frontpage.name)])
+                buttons.append(frontbutton)
+            except KeyError:
+                pass
+
+            srnames = sorted(srnames, key=lambda name: name.lower())
+            buttons.extend([NavButton(name, name) for name in srnames])
             menus.append(NavMenu(buttons, base_path='/promoted/live_promos',
                                  title='subreddit', type='lightdrop'))
 
@@ -203,6 +203,14 @@ class PromoteController(ListingController):
 
     def keep_fn(self):
         def keep(item):
+            if self.sort == "future_promos":
+                # this sort is used to review links that need to be approved
+                # skip links that don't have any paid campaigns
+                campaigns = list(PromoCampaign._by_link(item._id))
+                if not any(promote.authed_or_not_needed(camp)
+                           for camp in campaigns):
+                    return False
+
             if item.promoted and not item._deleted:
                 return True
             else:
@@ -232,9 +240,7 @@ class PromoteController(ListingController):
             elif self.sort == 'reported':
                 return queries.get_reported_links(get_promote_srid())
             elif self.sort == 'house':
-                campaigns = self.get_house_campaigns()
-                link_ids = {camp.link_id for camp in campaigns}
-                return [Link._fullname_from_id36(to36(id)) for id in link_ids]
+                return self.get_house_link_names()
             return queries.get_all_promoted_links()
         else:
             if self.sort == "future_promos":
@@ -277,7 +283,7 @@ class PromoteController(ListingController):
     def GET_edit_promo(self, link):
         if not link or link.promoted is None:
             return self.abort404()
-        rendered = wrap_links(link, wrapper=promote.sponsor_wrapper, skip=False)
+        rendered = wrap_links(link, skip=False)
         form = PromoteLinkForm(link, rendered)
         page = PromotePage('new_promo', content=form)
         return page.render()
@@ -292,13 +298,18 @@ class PromoteController(ListingController):
         return self.redirect(promote.promo_edit_url(link))
 
     @json_validate(sr=VSubmitSR('sr', promotion=True),
+                   location=VLocation(),
                    start=VDate('startdate'),
                    end=VDate('enddate'))
-    def GET_check_inventory(self, responder, sr, start, end):
+    def GET_check_inventory(self, responder, sr, location, start, end):
         sr = sr or Frontpage
-        available_by_datestr = inventory.get_available_pageviews(sr, start, end,
-                                                                 datestr=True)
-        return {'inventory': available_by_datestr}
+        if not location or not location.country:
+            available = inventory.get_available_pageviews(sr, start, end,
+                                                          datestr=True)
+        else:
+            available = inventory.get_available_pageviews_geotargeted(sr,
+                            location, start, end, datestr=True)
+        return {'inventory': available}
 
     @validate(
         VSponsorAdmin(),
@@ -325,7 +336,7 @@ class PromoteController(ListingController):
 
     # ## POST controllers below
     @validatedForm(VSponsorAdmin(),
-                   link=VLink("link_id"),
+                   link=VLink("link_id36"),
                    campaign=VPromoCampaign("campaign_id36"))
     def POST_freebie(self, form, jquery, link, campaign):
         if campaign_has_oversold_error(form, campaign):
@@ -384,16 +395,16 @@ class PromoteController(ListingController):
         else:
             form.set_html('.status', _('refund not needed'))
 
-    @validatedForm(VSponsor('link_id'),
+    @validatedForm(VSponsor('link_id36'),
                    VModhash(),
                    VRatelimit(rate_user=True,
                               rate_ip=True,
                               prefix='create_promo_'),
                    VShamedDomain('url'),
                    username=VLength('username', 100, empty_error=None),
-                   l=VLink('link_id'),
+                   l=VLink('link_id36'),
                    title=VTitle('title'),
-                   url=VUrl('url', allow_self=False, lookup=False),
+                   url=VUrl('url', allow_self=False),
                    selftext=VSelfText('text'),
                    kind=VOneOf('kind', ['link', 'self']),
                    ip=ValidIP(),
@@ -488,10 +499,8 @@ class PromoteController(ListingController):
                     changed = not trusted
 
             # only trips if the title and url are changed by a non-sponsor
-            if changed and not promote.is_unpaid(l):
+            if changed:
                 promote.unapprove_promotion(l)
-            if trusted and promote.is_unapproved(l):
-                promote.accept_promotion(l)
 
             # selftext can be changed at any time
             if kind == 'self':
@@ -548,7 +557,7 @@ class PromoteController(ListingController):
             PromotedLinkRoadblock.remove(sr, sd, ed)
             jquery.refresh()
 
-    @validatedForm(VSponsor('link_id'),
+    @validatedForm(VSponsor('link_id36'),
                    VModhash(),
                    dates=VDateRange(['startdate', 'enddate'],
                        earliest=timedelta(days=1),
@@ -556,15 +565,16 @@ class PromoteController(ListingController):
                        reference_date=promote.promo_datetime_now,
                        business_days=True,
                        sponsor_override=True),
-                   link=VLink('link_id'),
+                   link=VLink('link_id36'),
                    bid=VBid('bid', min=0, max=g.max_promote_bid,
                             coerce=False, error=errors.BAD_BID),
                    sr=VSubmitSR('sr', promotion=True),
                    campaign_id36=nop("campaign_id36"),
                    targeting=VLength("targeting", 10),
-                   priority=VPriority("priority"))
+                   priority=VPriority("priority"),
+                   location=VLocation())
     def POST_edit_campaign(self, form, jquery, link, campaign_id36,
-                          dates, bid, sr, targeting, priority):
+                          dates, bid, sr, targeting, priority, location):
         if not link:
             return
 
@@ -572,6 +582,8 @@ class PromoteController(ListingController):
 
         author = Account._byID(link.author_id, data=True)
         cpm = author.cpm_selfserve_pennies
+        if location:
+            cpm += g.cpm_selfserve_geotarget.pennies
 
         if (start and end and not promote.is_accepted(link) and
             not c.user_is_sponsor):
@@ -618,7 +630,7 @@ class PromoteController(ListingController):
 
             # you cannot edit the bid of a live ad unless it's a freebie
             if (campaign and bid != campaign.bid and
-                campaign.start_date < datetime.now(g.tz) and
+                promote.is_live_promo(link, campaign) and
                 not campaign.is_freebie()):
                 c.errors.add(errors.BID_LIVE, field='bid')
                 form.has_errors('bid', errors.BID_LIVE)
@@ -656,32 +668,38 @@ class PromoteController(ListingController):
 
         # Check inventory
         campaign = campaign if campaign_id36 else None
-        if (not priority.inventory_override and
-            has_oversold_error(form, campaign, start, end, bid, cpm, sr)):
-            return
+        if not priority.inventory_override:
+            oversold = has_oversold_error(form, campaign, start, end, bid, cpm,
+                                          sr, location)
+            if oversold:
+                return
 
         if campaign:
-            promote.edit_campaign(link, campaign, dates, bid, cpm, sr, priority)
-            r = promote.get_renderable_campaigns(link, campaign)
-            jquery.update_campaign(r.campaign_id36, r.start_date, r.end_date,
-                                   r.duration, r.bid, r.spent, r.cpm, r.sr,
-                                   r.priority_name, r.inventory_override,
-                                   r.status)
+            promote.edit_campaign(link, campaign, dates, bid, cpm, sr, priority,
+                                  location)
         else:
-            campaign = promote.new_campaign(link, dates, bid, cpm, sr, priority)
-            r = promote.get_renderable_campaigns(link, campaign)
-            jquery.new_campaign(r.campaign_id36, r.start_date, r.end_date,
-                                r.duration, r.bid, r.spent, r.cpm, r.sr,
-                                r.priority_name, r.inventory_override, r.status)
+            campaign = promote.new_campaign(link, dates, bid, cpm, sr, priority,
+                                            location)
+        rc = RenderableCampaign.from_campaigns(link, campaign)
+        jquery.update_campaign(campaign._fullname, rc.render_html())
 
-    @validatedForm(VSponsor('link_id'),
+    @validatedForm(VSponsor('link_id36'),
                    VModhash(),
-                   l=VLink('link_id'),
+                   l=VLink('link_id36'),
                    campaign=VPromoCampaign("campaign_id36"))
     def POST_delete_campaign(self, form, jquery, l, campaign):
         if l and campaign:
             promote.delete_campaign(l, campaign)
 
+    @validatedForm(VSponsorAdmin(),
+                   VModhash(),
+                   link=VLink('link_id36'),
+                   campaign=VPromoCampaign("campaign_id36"))
+    def POST_terminate_campaign(self, form, jquery, link, campaign):
+        if link and campaign:
+            promote.terminate_campaign(link, campaign)
+            rc = RenderableCampaign.from_campaigns(link, campaign)
+            jquery.update_campaign(campaign._fullname, rc.render_html())
 
     @validatedForm(VSponsor('container'),
                    VModhash(),
@@ -799,8 +817,8 @@ class PromoteController(ListingController):
         """
         return "nothing to see here."
 
-    @validate(VSponsor("link_id"),
-              link=VByName('link_id'),
+    @validate(VSponsor("link_name"),
+              link=VByName('link_name'),
               file=VUploadLength('file', 500*1024),
               img_type=VImageType('img_type'))
     def POST_link_thumb(self, link=None, file=None, img_type='jpg'):
